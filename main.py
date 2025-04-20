@@ -2,14 +2,12 @@
 import os
 import sys
 
-# Import specific needed values from config
 from config import (
     LINE_MODE, PROCESSING_MODE, GRADIO_SERVER_PORT, GRADIO_SHARE,
     INPUT_VIDEO_PATH, START_DATE, START_TIME
 )
 from core.utils import setup_torch_global_settings, setup_thread_affinity
 
-# Conditionally import based on LINE_MODE
 if LINE_MODE == 'interactive':
     from interface.gradio_app import create_interface
 else:
@@ -27,7 +25,6 @@ def run_app():
 
     if LINE_MODE == 'interactive':
         # --- Run Gradio Interface ---
-        # (Gradio logic remains the same)
         if create_interface is None:
              print("ERROR: Gradio components not loaded.", file=sys.stderr); sys.exit(1)
         try:

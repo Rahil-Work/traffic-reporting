@@ -67,16 +67,51 @@ def draw_tracking_trail(frame, trail_points, vehicle_id):
     cv2.polylines(frame, [pts], isClosed=False, color=color, thickness=2)
 
 def draw_zones(frame, zone_tracker):
-    # No change needed - uses zone_tracker.zones
-    if not hasattr(zone_tracker, 'zones') or not zone_tracker.zones: return frame
-    overlay = frame.copy(); alpha = 0.2
-    for direction, zone_data in zone_tracker.zones.items():
-        color = ZONE_COLORS.get(direction, DEFAULT_ZONE_COLOR); points = zone_data['points']
-        cv2.fillPoly(overlay, [points], color); cv2.polylines(frame, [points], True, color, 2)
-        center = zone_data['center']; cv2.putText(frame, direction.upper(), (center[0]-20, center[1]+10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
-        nx, ny = zone_data['perpendicular']; arrow_end = (int(center[0]+nx*20), int(center[1]+ny*20))
-        cv2.arrowedLine(frame, tuple(map(int,center)), arrow_end, color, 1, cv2.LINE_AA, tipLength=0.3)
-    cv2.addWeighted(overlay, alpha, frame, 1-alpha, 0, frame); return frame
+    """Draws zone polygons defined in the zone_tracker."""
+    # Check if zone_tracker and zones exist
+    if not hasattr(zone_tracker, 'zones') or not zone_tracker.zones:
+        # debug_print("draw_zones: No zones found in tracker.") # Optional debug
+        return frame # Return original frame if no zones
+
+    overlay = frame.copy(); alpha = 0.2 # For transparency
+
+    # Iterate through the directions and the polygon point arrays
+    for direction, polygon_points in zone_tracker.zones.items():
+
+        # Ensure polygon_points is a valid NumPy array with >= 3 points
+        if not isinstance(polygon_points, np.ndarray) or polygon_points.ndim != 2 or polygon_points.shape[0] < 3:
+            debug_print(f"draw_zones: Skipping invalid polygon data for direction '{direction}'. Shape: {getattr(polygon_points, 'shape', 'N/A')}")
+            continue
+
+        # Ensure dtype is int32 for drawing functions
+        if polygon_points.dtype != np.int32:
+            polygon_points = polygon_points.astype(np.int32)
+
+        # Get color for the zone
+        color = ZONE_COLORS.get(direction, DEFAULT_ZONE_COLOR)
+
+        # Draw filled polygon on overlay and outline on original frame
+        try:
+            cv2.fillPoly(overlay, [polygon_points], color)
+            cv2.polylines(frame, [polygon_points], isClosed=True, color=color, thickness=2)
+
+            # Calculate centroid for placing the direction label
+            M = cv2.moments(polygon_points)
+            if M["m00"] != 0: # Avoid division by zero
+                center_x = int(M["m10"] / M["m00"])
+                center_y = int(M["m01"] / M["m00"])
+                # Put direction text near the calculated center
+                cv2.putText(frame, direction.upper(), (center_x - 20, center_y + 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
+            # else: debug_print(f"draw_zones: Could not calculate center for label '{direction}'.")
+
+        except Exception as e:
+            print(f"ERROR drawing zone for direction '{direction}': {e}")
+            # Continue trying to draw other zones if one fails
+
+    # Blend the overlay with the frame
+    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+    return frame
 
 def draw_event_marker(frame, point, event_type, vehicle_id_short):
     point_int = tuple(map(int, point)); text = f"{event_type[0]}:{vehicle_id_short}"

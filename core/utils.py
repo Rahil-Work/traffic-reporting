@@ -56,19 +56,42 @@ def normalize_direction(direction):
     """Convert direction to lowercase for consistent comparison."""
     return direction.lower() if direction else ""
 
-def is_valid_movement(from_dir, to_dir):
-    """Check if movement from from_dir to to_dir is valid based on config."""
+def is_valid_movement(from_dir, to_dir, active_zones):
+    """
+    Check if movement from from_dir to to_dir is valid based on config
+    AND ensures both directions are present in the active_zones list/set.
+    Args:
+        from_dir (str): The entry direction.
+        to_dir (str): The exit direction.
+        active_zones (list or set): Collection of lowercase active zone names (e.g., ['north', 'west', 'south']).
+    """
     from_dir_norm = normalize_direction(from_dir)
     to_dir_norm = normalize_direction(to_dir)
 
+    # Basic checks
     if not from_dir_norm or not to_dir_norm: return False
     if from_dir_norm == to_dir_norm: return False # U-turn
-    if from_dir_norm not in VALID_MOVEMENTS: return False
 
-    valid = to_dir_norm in VALID_MOVEMENTS.get(from_dir_norm, [])
-    if not valid and DEBUG_MODE:
-         debug_print(f"Invalid movement: '{to_dir_norm}' is not a valid exit from '{from_dir_norm}'. Valid: {VALID_MOVEMENTS.get(from_dir_norm)}")
-    return valid
+    # --- Check if both directions are actually active zones ---
+    if not active_zones or from_dir_norm not in active_zones or to_dir_norm not in active_zones:
+        if DEBUG_MODE:
+            debug_print(f"Invalid movement: One or both directions ('{from_dir_norm}' -> '{to_dir_norm}') not in active zones: {active_zones}")
+        return False
+
+    # Check against the base VALID_MOVEMENTS rules from config
+    if from_dir_norm not in VALID_MOVEMENTS:
+        if DEBUG_MODE:
+             debug_print(f"Invalid movement: Entry direction '{from_dir_norm}' not found in VALID_MOVEMENTS config.")
+        return False
+
+    # Check if the target direction is a valid exit from the entry direction per config rules
+    valid_config_targets = VALID_MOVEMENTS.get(from_dir_norm, [])
+    is_valid_target = to_dir_norm in valid_config_targets
+
+    if not is_valid_target and DEBUG_MODE:
+         debug_print(f"Invalid movement: '{to_dir_norm}' not a valid exit from '{from_dir_norm}' per VALID_MOVEMENTS. Valid targets: {valid_config_targets}")
+
+    return is_valid_target
 
 def setup_thread_affinity(perf_cores=8, eff_cores=4):
     """Attempt to set thread affinity for hybrid CPUs (best effort)."""
