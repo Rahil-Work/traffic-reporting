@@ -4,7 +4,7 @@ from datetime import datetime
 import torch # Import torch to check GPU capability
 
 PROCESSING_MODE = 'enhanced'
-LINE_MODE = 'interactive'
+LINE_MODE = 'hardcoded'
 ENABLE_VISUALIZATION = True
 
 # --- Input Settings (primarily for hardcoded mode) ---
@@ -21,7 +21,6 @@ TARGET_FPS = 20
 BASE_OUTPUT_DIR = "C:/Users/EMAAN/Documents/YOLO/project/output"
 VIDEO_OUTPUT_DIR = os.path.join(BASE_OUTPUT_DIR, "videos")
 REPORT_OUTPUT_DIR = os.path.join(BASE_OUTPUT_DIR, "reports")
-EXCEL_REPORT_NAME = "detection_logs.xlsx"
 
 # --- Model Configuration ---
 # MODEL_PATH = r"C:/Users/EMAAN/Documents/YOLO/project/models/weights/SGDMed_SGD_LR0p0100_WD0p00050_Cls1p50_Mix0p15_20250418_112036.pt"
@@ -70,11 +69,11 @@ TRACKER_CONFIG = ''
 
 # Timeout durations - Keep Increased slightly more
 VEHICLE_TIMEOUTS = {
-    'Light Vehicle': 400, 'Motorcycle': 400, 'Minibus Taxi': 500,
-    'Short Truck': 500, 'Medium Truck': 550, 'Long Truck': 600,
-    'Bus': 550, 'Pedestrian': 650, 'Cyclist': 650,
-    'Animal drawn vehicle': 650, 'Person with wheel barrow': 650,
-    'default': 400 # Increased default timeout
+    'Light Vehicle': 40, 'Motorcycle': 40, 'Minibus Taxi': 50,
+    'Short Truck': 50, 'Medium Truck': 55, 'Long Truck': 60,
+    'Bus': 55, 'Pedestrian': 65, 'Cyclist': 65,
+    'Animal drawn vehicle': 65, 'Person with wheel barrow': 65,
+    'default': 40 # Increased default timeout
 }
 TRACK_HISTORY_LENGTH = 100 # Keep reduced slightly
 

@@ -6,10 +6,7 @@ import os
 from collections import OrderedDict
 
 # --- Configuration Import ---
-from config import (
-    EXCEL_REPORT_NAME, VEHICLE_ID_MAP, REPORT_OUTPUT_DIR,
-    ALL_VEHICLE_TYPES, VALID_MOVEMENTS # Make sure these are defined in config
-)
+from config import VEHICLE_ID_MAP, REPORT_OUTPUT_DIR, VALID_MOVEMENTS
 # --- Utility Import ---
 from core.utils import debug_print, get_display_direction
 
@@ -91,8 +88,7 @@ def _build_rsa_direction_map(primary_direction, active_directions, valid_movemen
 
 
 # --- Main Report Function ---
-def create_excel_report(detection_events, completed_paths_data, start_datetime,
-                         zone_tracker=None, primary_direction=None):
+def create_excel_report(completed_paths_data, start_datetime, primary_direction, video_path):
     """
     Creates a multi-sheet Excel report: Vehicle Logs (1 row/path), Intervals (24hr),
     Directional Counts (multi-header), RSA Output.
@@ -171,7 +167,9 @@ def create_excel_report(detection_events, completed_paths_data, start_datetime,
     try:
         output_report_dir = REPORT_OUTPUT_DIR
         os.makedirs(output_report_dir, exist_ok=True)
-        excel_full_path = os.path.join(output_report_dir, EXCEL_REPORT_NAME)
+        output_filename_base=f"detection_logs_{os.path.splitext(os.path.basename(video_path))[0]}"
+        excel_full_path = os.path.join(output_report_dir, f"{output_filename_base}.csv")
+
 
         with pd.ExcelWriter(excel_full_path, engine='xlsxwriter') as writer:
             workbook = writer.book
@@ -284,7 +282,8 @@ def create_excel_report(detection_events, completed_paths_data, start_datetime,
                 for path in valid_paths_structured:
                     entry_key = path['direction_from']; exit_key = path['direction_to']; ts_obj = path['timestamp']; v_type = path['vehicle_type']
                     dir_num = rsa_direction_map.get((entry_key, exit_key), 0)
-                    base_id = VEHICLE_ID_MAP.get(v_type, '?'); v_code = f"{base_id},1"
+                    base_id = VEHICLE_ID_MAP.get(v_type, '?')
+                    v_code = f"{base_id},1" if ',1' not in base_id else base_id
                     ts_str = ts_obj.strftime('%y%m%d,%H%M%S%f')[:-3]
                     rsa_line = f"10,9,1,0,{ts_str},{dir_num},{dir_num},1,{v_code}"
                     rsa_data_lines.append(rsa_line)
