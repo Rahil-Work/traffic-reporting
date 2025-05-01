@@ -89,7 +89,7 @@ class ZoneTracker:
                 elif prev_in and not curr_in: event_type = "EXIT"
 
                 if event_type:
-                    print(f"***** Zone Transition Detected (BottomCenter) ***** V:{vehicle_id} Dir:{direction} Type:{event_type} *****")
+                    # print(f"***** Zone Transition Detected (BottomCenter) ***** V:{vehicle_id} Dir:{direction} Type:{event_type} *****")
                     # print(f"  PrevCenter: {prev_center_point} (In: {prev_in}), CurrBC: {current_bottom_center} (In: {curr_in})") # Optional
 
                     self.zone_cooldowns[key] = current_time

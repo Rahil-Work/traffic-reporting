@@ -57,3 +57,7 @@ coverage.xml
 *.log
 
 *.pt
+
+*.mp4
+
+models/weights/*

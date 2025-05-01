@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from config import (
     REIDENTIFICATION_TIMEOUT, VEHICLE_TIMEOUTS,
     TRACK_HISTORY_LENGTH,
-    # MAX_MATCHING_DISTANCE, # <-- REMOVED IMPORT
+    MAX_MATCHING_DISTANCE,
     MAX_CONSECUTIVE_MISSES
 )
 from core.utils import debug_print
@@ -32,7 +32,7 @@ class VehicleTracker:
     def find_best_match(self, center_point, current_frame_time):
         """Finds the best match, prioritizing non-stale tracks."""
         best_match_id = None
-        min_dist_sq = (50 * 50) # Standard max distance squared
+        min_dist_sq = (MAX_MATCHING_DISTANCE * MAX_MATCHING_DISTANCE) # Standard max distance squared
 
         best_non_stale_id = None
         min_non_stale_dist_sq = min_dist_sq
@@ -82,7 +82,6 @@ class VehicleTracker:
             return None
 
     def get_consistent_type(self, vehicle_id, current_type_name):
-        # (No change needed here)
         if vehicle_id not in self.vehicle_type_history: self.vehicle_type_history[vehicle_id] = {current_type_name: 1}; return current_type_name
         counts = self.vehicle_type_history[vehicle_id]; counts[current_type_name] = counts.get(current_type_name, 0) + 1
         return max(counts, key=counts.get)
@@ -121,32 +120,52 @@ class VehicleTracker:
     def register_exit(self, vehicle_id, exit_direction, exit_time, exit_point):
         if vehicle_id in self.active_vehicles and self.active_vehicles[vehicle_id]['status'] == 'active':
             data = self.active_vehicles[vehicle_id]
+
+            final_type = data.get('type', 'UnknownType') # Start with current type as fallback
+            if vehicle_id in self.vehicle_type_history and self.vehicle_type_history[vehicle_id]:
+                counts = self.vehicle_type_history[vehicle_id]
+                final_type = max(counts, key=counts.get) # Get most frequent from history
+            data['type'] = final_type # Update the type in the data dict
+
             data.update({'exit_direction': exit_direction, 'exit_time': exit_time, 'exit_point': exit_point, 'status': 'exited'})
             time_in_int = (exit_time - data['entry_time']).total_seconds(); data['time_in_intersection'] = round(time_in_int, 2)
-            self.completed_paths.append(data.copy())
-            debug_print(f"EXIT: V:{vehicle_id} to {exit_direction}. Time: {time_in_int:.2f}s")
+            self.completed_paths.append(data.copy()) # Appends data with the most common type
+            debug_print(f"EXIT: V:{vehicle_id} ({final_type}) to {exit_direction}. Time: {time_in_int:.2f}s")
             return True, time_in_int
         debug_print(f"WARN: Exit ignored for inactive/already exited V:{vehicle_id}"); return False, None
 
     def check_timeouts(self, current_time: datetime):
         timed_out_ids = []
-        for v_id, data in list(self.active_vehicles.items()): # Use list copy
-             if data['status'] == 'active':
+        for v_id, data in list(self.active_vehicles.items()):
+            if data['status'] == 'active':
                 time_in_int = (current_time - data['entry_time']).total_seconds()
-                v_type = data.get('type', 'default'); timeout = VEHICLE_TIMEOUTS.get(v_type, VEHICLE_TIMEOUTS['default'])
+                v_type_current = data.get('type', 'default')
+                timeout = VEHICLE_TIMEOUTS.get(v_type_current, VEHICLE_TIMEOUTS['default'])
                 if time_in_int > timeout:
+                    final_type = data.get('type', 'UnknownType')
+                    if v_id in self.vehicle_type_history and self.vehicle_type_history[v_id]:
+                        counts = self.vehicle_type_history[v_id]
+                        final_type = max(counts, key=counts.get)
+                    data['type'] = final_type # Update the type before adding
                     miss_count = self.consecutive_misses.get(v_id, 0)
-                    debug_print(f"TIMEOUT: V:{v_id} ({v_type}) after {time_in_int:.1f}s. Missed frames: {miss_count}")
+                    debug_print(f"TIMEOUT: V:{v_id} ({final_type}) after {time_in_int:.1f}s. Missed frames: {miss_count}")
                     data.update({'status':'timed_out', 'exit_time':current_time, 'exit_direction':'TIMEOUT', 'time_in_intersection':round(time_in_int, 2)})
                     self.completed_paths.append(data.copy()); timed_out_ids.append(v_id)
         return timed_out_ids
 
     def force_exit_vehicle(self, vehicle_id, exit_time: datetime):
-         if vehicle_id in self.active_vehicles and self.active_vehicles[vehicle_id]['status'] == 'active':
-             data = self.active_vehicles[vehicle_id]; time_in_int = (exit_time - data['entry_time']).total_seconds()
-             data.update({'status':'forced_exit', 'exit_time':exit_time, 'exit_direction':'FORCED', 'time_in_intersection':round(time_in_int, 2)})
-             self.completed_paths.append(data.copy()); debug_print(f"FORCED EXIT: V:{vehicle_id}"); return True
-         return False
+        if vehicle_id in self.active_vehicles and self.active_vehicles[vehicle_id]['status'] == 'active':
+            data = self.active_vehicles[vehicle_id]
+            final_type = data.get('type', 'UnknownType')
+            if vehicle_id in self.vehicle_type_history and self.vehicle_type_history[vehicle_id]:
+                counts = self.vehicle_type_history[vehicle_id]
+                final_type = max(counts, key=counts.get)
+            data['type'] = final_type
+            time_in_int = (exit_time - data['entry_time']).total_seconds()
+            data.update({'status':'forced_exit', 'exit_time':exit_time, 'exit_direction':'FORCED', 'time_in_intersection':round(time_in_int, 2)})
+            self.completed_paths.append(data.copy());
+            debug_print(f"FORCED EXIT: V:{vehicle_id} ({final_type})"); return True
+        return False
 
     def remove_vehicle_data(self, vehicle_id):
         """Removes all tracking data associated with a vehicle ID."""

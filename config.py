@@ -4,7 +4,8 @@ from datetime import datetime
 import torch # Import torch to check GPU capability
 
 PROCESSING_MODE = 'enhanced'
-LINE_MODE = 'hardcoded'
+LINE_MODE = 'interactive'
+ENABLE_VISUALIZATION = True
 
 # --- Input Settings (primarily for hardcoded mode) ---
 INPUT_VIDEO_PATH = "C:/Users/EMAAN/Documents/YOLO/5 minute test - 4 Way Intersection.mp4"
@@ -13,16 +14,21 @@ _now = datetime.now()
 START_DATE = _now.strftime("%y%m%d")
 START_TIME = _now.strftime("%H%M%S") + f"{_now.microsecond // 1000:03d}"
 
+DEFAULT_PRIMARY_DIRECTION = 'south'
+
 # --- Core Settings ---
 TARGET_FPS = 20
-VIDEO_OUTPUT_DIR = "output_videos"
+BASE_OUTPUT_DIR = "C:/Users/EMAAN/Documents/YOLO/project/output"
+VIDEO_OUTPUT_DIR = os.path.join(BASE_OUTPUT_DIR, "videos")
+REPORT_OUTPUT_DIR = os.path.join(BASE_OUTPUT_DIR, "reports")
 EXCEL_REPORT_NAME = "detection_logs.xlsx"
 
 # --- Model Configuration ---
-MODEL_PATH = r"C:\Users\EMAAN\Documents\YOLO\project\SGDMed_SGD_LR0p0100_WD0p00050_Cls1p50_Mix0p15_20250418_112036.pt"
-CONF_THRESHOLD = 0.40 # Keep SLIGHTLY LOWER CONF to potentially keep weaker detections
+# MODEL_PATH = r"C:/Users/EMAAN/Documents/YOLO/project/models/weights/SGDMed_SGD_LR0p0100_WD0p00050_Cls1p50_Mix0p15_20250418_112036.pt"
+MODEL_PATH = r"C:\Users\EMAAN\Documents\YOLO\project\models\weights\SGDMed_SGD_LR0p0100_WD0p00050_Cls1p50_Mix0p15_20250418_112036.engine"
+CONF_THRESHOLD = 0.45 # Keep SLIGHTLY LOWER CONF to potentially keep weaker detections
 IOU_THRESHOLD = 0.6   # Keep slightly higher
-MODEL_INPUT_SIZE = 320 # Keep smaller size for performance
+MODEL_INPUT_SIZE = 416 # Keep smaller size for performance
 
 # --- Line & Zone Definitions ---
 LINE_POINTS = {
@@ -57,10 +63,10 @@ _cpu_count = os.cpu_count(); THREAD_COUNT = min(64, _cpu_count * 2) if _cpu_coun
 MIXED_PRECISION = True if PROCESSING_MODE == 'enhanced' and torch.cuda.is_available() else False
 PARALLEL_STREAMS = 16 if PROCESSING_MODE == 'enhanced' else 2
 
-# --- Tracking Configuration --- ### AGGRESSIVE CHANGES HERE (excluding distance) ###
-REIDENTIFICATION_TIMEOUT = 10.0 # Keep INCREASED: Allow more time (seconds) to match a lost track
-# MAX_MATCHING_DISTANCE = 75    # <-- REVERTED/REMOVED: Rely on internal tracker limit (50px)
-TRACKER_CONFIG = 'bytetrack.yaml'
+# --- Tracking Configuration --- 
+REIDENTIFICATION_TIMEOUT = 10.0
+MAX_MATCHING_DISTANCE = 50
+TRACKER_CONFIG = ''
 
 # Timeout durations - Keep Increased slightly more
 VEHICLE_TIMEOUTS = {
@@ -73,7 +79,7 @@ VEHICLE_TIMEOUTS = {
 TRACK_HISTORY_LENGTH = 100 # Keep reduced slightly
 
 # Keep configuration for tracker behavior
-MAX_CONSECUTIVE_MISSES = 100 # Allow track to persist for X frames without detection
+MAX_CONSECUTIVE_MISSES = 20 # Allow track to persist for X frames without detection
 
 # --- Reporting Configuration ---
 VEHICLE_ID_MAP = { 'Light Vehicle': '1', 'Motorcycle': '11', 'Minibus Taxi': '13', 'Short Truck': '2T,2', 'Medium Truck': '2T,3', 'Long Truck': '2T,4', 'Bus': '2B', 'Pedestrian': '9P', 'Cyclist': '9C', 'Animal drawn vehicle': '95', 'Person with wheel barrow': '100' }

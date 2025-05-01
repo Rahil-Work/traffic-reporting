@@ -4,10 +4,7 @@
 import gradio as gr
 import os
 import re
-# Import cv2 and numpy if needed for any direct drawing in handlers,
-# though ideally drawing happens within VideoProcessor methods.
-# import cv2
-# import numpy as np
+import time
 from config import (
     START_DATE, START_TIME, PROCESSING_MODE, VIDEO_OUTPUT_DIR, LINE_MODE
 )
@@ -70,21 +67,25 @@ def handle_clear_polygons():
     return frame_with_polys, status
 
 # Process the video (uses finalized polygons)
-def handle_process(video_path, start_date, start_time, progress=gr.Progress(track_tqdm=True)):
+def handle_process(video_path, start_date, start_time, primary_direction, progress=gr.Progress(track_tqdm=True)):
     # This function structure remains the same as before
     # It calls processor.process_video, which internally uses the finalized polygons
     # if LINE_MODE is interactive.
     progress(0, desc="Starting Processing...")
     debug_print(f"Gradio: Starting video processing for {video_path}")
+    debug_print(f"Gradio: Primary Direction selected: {primary_direction}")
     if video_path is None:
         # Return updates for all output components on error
         return "Please upload a video first.", None, "N/A", "N/A", "N/A", "N/A"
+    
+    if not primary_direction:
+         return "Please select a Primary Direction.", None, "N/A", "N/A", "N/A", "N/A"
 
     # Run the processing - processor.process_video uses self.gradio_polygons
     # Add a try-except block here to catch potential errors during processing setup (like zone validation)
     # and report them back to the Gradio UI gracefully.
     try:
-        result_message_raw = processor.process_video(video_path, start_date, start_time)
+        result_message_raw = processor.process_video(video_path, start_date, start_time, primary_direction=primary_direction.lower())
         debug_print(f"Gradio: Processing finished.")
     except ValueError as ve:
          # Catch specific validation errors (like not enough zones)
@@ -99,7 +100,7 @@ def handle_process(video_path, start_date, start_time, progress=gr.Progress(trac
          return f"Unexpected Error: {e}", None, "N/A", "N/A", "N/A", "N/A"
 
 
-    # --- Stat Parsing (No change needed here) ---
+    # --- Stat Parsing ---
     frames_processed = "N/A"; time_seconds = "N/A"; fps = "N/A"; completed_paths = "N/A"
     output_log = result_message_raw
     if "✅ Processing completed" in result_message_raw:
@@ -123,7 +124,7 @@ def handle_process(video_path, start_date, start_time, progress=gr.Progress(trac
         progress(1.0, desc="Finished (Unknown State)")
 
 
-    # --- Find Output Video (No change needed here) ---
+    # --- Find Output Video ---
     output_video_path = None
     if "✅ Processing completed" in result_message_raw:
         try:
@@ -186,6 +187,12 @@ def create_interface():
                                  start_time = gr.Textbox(
                                      label="Start Time", value=START_TIME, placeholder="HHMMSSmmm"
                                  )
+                        primary_direction_input = gr.Dropdown(
+                            label="Select Primary Direction",
+                            choices=["North", "South", "East", "West"],
+                            value="South", # Default value
+                            info="Select the main approach direction for numbering."
+                        )
                         gr.Markdown("---") # Separator
                         status_text_draw = gr.Textbox(
                             label="✏️ Drawing Helper",
@@ -297,7 +304,7 @@ def create_interface():
         # Assign the process_btn click handler
         process_btn.click(
             fn=handle_process,
-            inputs=[video_input, start_date, start_time],
+            inputs=[video_input, start_date, start_time, primary_direction_input],
             outputs=process_outputs # All result components
         )
 

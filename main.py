@@ -4,7 +4,7 @@ import sys
 
 from config import (
     LINE_MODE, PROCESSING_MODE, GRADIO_SERVER_PORT, GRADIO_SHARE,
-    INPUT_VIDEO_PATH, START_DATE, START_TIME
+    INPUT_VIDEO_PATH, START_DATE, START_TIME, DEFAULT_PRIMARY_DIRECTION
 )
 from core.utils import setup_torch_global_settings, setup_thread_affinity
 
@@ -51,7 +51,8 @@ def run_app():
             result_message = processor.process_video(
                 video_path=INPUT_VIDEO_PATH,
                 start_date_str=START_DATE,
-                start_time_str=START_TIME
+                start_time_str=START_TIME,
+                primary_direction=DEFAULT_PRIMARY_DIRECTION
             )
             print("\n--- Processing Result ---")
             print(result_message)
