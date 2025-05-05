@@ -4,7 +4,7 @@ from datetime import datetime
 import torch # Import torch to check GPU capability
 
 PROCESSING_MODE = 'enhanced'
-LINE_MODE = 'interactive'
+LINE_MODE = 'hardcoded'
 ENABLE_VISUALIZATION = True
 
 # --- Input Settings (primarily for hardcoded mode) ---
