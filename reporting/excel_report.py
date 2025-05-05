@@ -168,7 +168,7 @@ def create_excel_report(completed_paths_data, start_datetime, primary_direction,
         output_report_dir = REPORT_OUTPUT_DIR
         os.makedirs(output_report_dir, exist_ok=True)
         output_filename_base=f"detection_logs_{os.path.splitext(os.path.basename(video_path))[0]}"
-        excel_full_path = os.path.join(output_report_dir, f"{output_filename_base}.csv")
+        excel_full_path = os.path.join(output_report_dir, f"{output_filename_base}.xlsx")
 
 
         with pd.ExcelWriter(excel_full_path, engine='xlsxwriter') as writer:

@@ -4,7 +4,7 @@ from datetime import datetime
 import torch # Import torch to check GPU capability
 
 PROCESSING_MODE = 'enhanced'
-LINE_MODE = 'hardcoded'
+LINE_MODE = 'interactive'
 ENABLE_VISUALIZATION = True
 
 # --- Input Settings (primarily for hardcoded mode) ---
@@ -24,7 +24,7 @@ REPORT_OUTPUT_DIR = os.path.join(BASE_OUTPUT_DIR, "reports")
 
 # --- Model Configuration ---
 # MODEL_PATH = r"C:/Users/EMAAN/Documents/YOLO/project/models/weights/SGDMed_SGD_LR0p0100_WD0p00050_Cls1p50_Mix0p15_20250418_112036.pt"
-MODEL_PATH = r"C:\Users\EMAAN\Documents\YOLO\project\models\weights\SGDMed_SGD_LR0p0100_WD0p00050_Cls1p50_Mix0p15_20250418_112036.engine"
+MODEL_PATH = r"C:/Users/EMAAN/Documents/YOLO/project/models/weights/SGDMed_SGD_LR0p0100_WD0p00050_Cls1p50_Mix0p15_20250418_112036.engine"
 CONF_THRESHOLD = 0.45 # Keep SLIGHTLY LOWER CONF to potentially keep weaker detections
 IOU_THRESHOLD = 0.6   # Keep slightly higher
 MODEL_INPUT_SIZE = 416 # Keep smaller size for performance
