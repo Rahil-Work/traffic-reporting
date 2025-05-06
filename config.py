@@ -67,13 +67,30 @@ REIDENTIFICATION_TIMEOUT = 10.0
 MAX_MATCHING_DISTANCE = 50
 TRACKER_CONFIG = ''
 
-# Timeout durations - Keep Increased slightly more
+# --- Auto Chunking for Long Videos ---
+ENABLE_AUTO_CHUNKING = True        # Set to True to enable automatic chunking
+AUTO_CHUNK_THRESHOLD_MINUTES = 121   # Threshold duration (in minutes) above which chunking is triggered
+AUTO_CHUNK_DURATION_MINUTES = 120    # Desired duration (in minutes) for each chunk
+CHUNK_TEMP_DIR = os.path.join(BASE_OUTPUT_DIR, "temp_chunks")
+REPORT_TEMP_DIR = os.path.join(BASE_OUTPUT_DIR, "temp_reports")
+FFMPEG_PATH = "ffmpeg"
+
+# --- GPU Encoding Settings ---
+# Only used if ENABLE_VISUALIZATION is True AND using the GPU pipeline
+ENCODER_CODEC = 'h264'       # 'h264' or 'hevc'
+ENCODER_BITRATE = '8M'       # e.g., '5M', '8M', '10M' (Mbps)
+ENCODER_PRESET = 'p4'        # Quality/speed tradeoff: p1..p7 ('p4' is balanced)
+RAW_STREAM_FILENAME = "temp_encoded_stream.raw" # Temp file name for NVENC output
+FINAL_VIDEO_EXTENSION = '.mp4' # Or .mkv
+
+
+# Timeout durations
 VEHICLE_TIMEOUTS = {
     'Light Vehicle': 40, 'Motorcycle': 40, 'Minibus Taxi': 50,
     'Short Truck': 50, 'Medium Truck': 55, 'Long Truck': 60,
     'Bus': 55, 'Pedestrian': 65, 'Cyclist': 65,
     'Animal drawn vehicle': 65, 'Person with wheel barrow': 65,
-    'default': 40 # Increased default timeout
+    'default': 40
 }
 TRACK_HISTORY_LENGTH = 100 # Keep reduced slightly
 

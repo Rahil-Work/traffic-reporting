@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, time
 import os
+import glob # For finding report files
 from collections import OrderedDict
 
 # --- Configuration Import ---
@@ -88,7 +89,7 @@ def _build_rsa_direction_map(primary_direction, active_directions, valid_movemen
 
 
 # --- Main Report Function ---
-def create_excel_report(completed_paths_data, start_datetime, primary_direction, video_path):
+def create_excel_report(completed_paths_data, start_datetime, primary_direction, video_path, output_path_override=None):
     """
     Creates a multi-sheet Excel report: Vehicle Logs (1 row/path), Intervals (24hr),
     Directional Counts (multi-header), RSA Output.
@@ -142,15 +143,27 @@ def create_excel_report(completed_paths_data, start_datetime, primary_direction,
     # --- Build RSA Direction Map ---
     rsa_direction_map = _build_rsa_direction_map(primary_direction, active_directions, VALID_MOVEMENTS)
 
-    # --- 2. Create Intervals (Full 24 Hours) ---
-    intervals = []; report_date = start_datetime.date(); day_start_dt = datetime.combine(report_date, time.min); day_end_dt = day_start_dt + timedelta(days=1); curr_interval_start = day_start_dt
+    # --- 2. Create Intervals Data (Full 24 Hours relative to start_datetime) ---
+    intervals = []; report_date_obj = start_datetime.date()
+    day_start_dt = datetime.combine(report_date_obj, time.min)
+    day_end_dt = day_start_dt + timedelta(days=1)
+    curr_interval_start = day_start_dt
     interval_bins = [day_start_dt]; interval_labels = []
     while curr_interval_start < day_end_dt:
-        interval_end = curr_interval_start + timedelta(minutes=15); interval_labels.append(f"{curr_interval_start.strftime('%H:%M:%S')} - {interval_end.strftime('%H:%M:%S')}")
-        interval_bins.append(interval_end); intervals.append({'Date': curr_interval_start.strftime('%m/%d/%Y'), 'Time Intervals': interval_labels[-1], 'Start Time': curr_interval_start.strftime('%H:%M:%S'), 'End Time': interval_end.strftime('%H:%M:%S')}); curr_interval_start += timedelta(minutes=15)
+        interval_end = curr_interval_start + timedelta(minutes=15)
+        interval_labels.append(f"{curr_interval_start.strftime('%H:%M:%S')} - {interval_end.strftime('%H:%M:%S')}")
+        interval_bins.append(interval_end)
+        intervals.append({
+            'Date': report_date_obj.strftime('%m/%d/%Y'), # Use the actual date from start_datetime
+            'Time Intervals': interval_labels[-1],
+            'Start Time': curr_interval_start.strftime('%H:%M:%S'),
+            'End Time': interval_end.strftime('%H:%M:%S')
+        })
+        curr_interval_start += timedelta(minutes=15)
 
     # --- 3. Prepare DataFrames ---
-    df_log_summary = pd.DataFrame(vehicle_log_summary_data); df_intervals = pd.DataFrame(intervals)
+    df_log_summary = pd.DataFrame(vehicle_log_summary_data)
+    df_intervals = pd.DataFrame(intervals)
     if not valid_paths_structured:
         df_moves = pd.DataFrame(columns=['vehicle_type', 'direction_from', 'direction_to', 'timestamp', 'TIME'])
     else:
@@ -159,21 +172,26 @@ def create_excel_report(completed_paths_data, start_datetime, primary_direction,
             path['direction_from_disp'] = get_display_direction(path['direction_from'])
             path['direction_to_disp'] = get_display_direction(path['direction_to'])
         df_moves = pd.DataFrame(valid_paths_structured); df_moves['timestamp'] = pd.to_datetime(df_moves['timestamp'])
-        time_cat = pd.CategoricalDtype(categories=interval_labels, ordered=True); df_moves['TIME'] = pd.cut(df_moves['timestamp'], bins=interval_bins, labels=interval_labels, right=False, ordered=True).astype(time_cat)
-        vehicle_cat = pd.CategoricalDtype(categories=all_valid_vehicle_types, ordered=False); df_moves['vehicle_type'] = df_moves['vehicle_type'].astype(vehicle_cat)
+        time_cat = pd.CategoricalDtype(categories=interval_labels, ordered=True)
+        df_moves['TIME'] = pd.cut(df_moves['timestamp'], bins=interval_bins, labels=interval_labels, right=False, ordered=True).astype(time_cat)
+        vehicle_cat = pd.CategoricalDtype(categories=all_valid_vehicle_types, ordered=True)
+        df_moves['vehicle_type'] = df_moves['vehicle_type'].astype(vehicle_cat)
 
-    # --- Create Excel File ---
+    # --- Determine Output Path ---
+    excel_full_path = None
+    if output_path_override:
+        excel_full_path = output_path_override
+        os.makedirs(os.path.dirname(excel_full_path), exist_ok=True)
+    else:
+        os.makedirs(REPORT_OUTPUT_DIR, exist_ok=True)
+        output_filename_base = f"detection_logs_{os.path.splitext(os.path.basename(video_path))[0]}"
+        excel_full_path = os.path.join(REPORT_OUTPUT_DIR, f"{output_filename_base}.xlsx")
+
+    print(f"Attempting to write Excel report to: {excel_full_path}")
     excel_created_path = None
     try:
-        output_report_dir = REPORT_OUTPUT_DIR
-        os.makedirs(output_report_dir, exist_ok=True)
-        output_filename_base=f"detection_logs_{os.path.splitext(os.path.basename(video_path))[0]}"
-        excel_full_path = os.path.join(output_report_dir, f"{output_filename_base}.xlsx")
-
-
         with pd.ExcelWriter(excel_full_path, engine='xlsxwriter') as writer:
             workbook = writer.book
-
             # --- Sheet: Vehicle Logs ---
             if not df_log_summary.empty:
                  log_cols = ['Vehicle Tracker ID', 'Object ID', 'Object Name', 'Entry Direction', 'Exit Direction', 'Entry Time', 'Exit Time', 'Time in Intersection (s)']
@@ -303,3 +321,113 @@ def create_excel_report(completed_paths_data, start_datetime, primary_direction,
         return None
 
     return excel_created_path
+
+def consolidate_excel_reports(temp_report_dir, final_output_path, original_report_date_obj):
+    """Consolidates chunk reports into a final report."""
+    print(f"Consolidating reports from directory: {temp_report_dir}")
+    # Look for .xlsx files specifically
+    chunk_report_files = sorted(glob.glob(os.path.join(temp_report_dir, "report_*.xlsx")))
+
+    if not chunk_report_files:
+        print("No temporary report files found (expected report_*.xlsx). Nothing to consolidate.")
+        return None
+
+    print(f"Found {len(chunk_report_files)} chunk reports to consolidate.")
+
+    all_log_dfs = []
+    aggregated_counts = {} # Key: sheet name (e.g., "From North"), Value: DataFrame
+    interval_df_final = None # Will take from the first report
+    rsa_header_lines = None # Store header from the first RSA sheet
+    all_rsa_data_lines = [] # Store data lines from all RSA sheets
+
+    # Define all possible vehicle types for columns from config
+    all_vehicle_types_ordered = list(VEHICLE_ID_MAP.keys())
+    # Define all possible "From" directions (can be dynamic from VALID_MOVEMENTS keys)
+    possible_from_dirs_disp = [f"From {get_display_direction(d)}" for d in VALID_MOVEMENTS.keys()]
+
+    # Initialize aggregated_counts with full 24h interval index and all possible columns
+    intervals_24h_labels = []
+    day_start_dt = datetime.combine(original_report_date_obj, time.min)
+    curr_interval_start = day_start_dt
+    while curr_interval_start < (day_start_dt + timedelta(days=1)):
+        intervals_24h_labels.append(f"{curr_interval_start.strftime('%H:%M:%S')} - {(curr_interval_start + timedelta(minutes=15)).strftime('%H:%M:%S')}")
+        curr_interval_start += timedelta(minutes=15)
+    
+    for from_dir_disp_key in possible_from_dirs_disp:
+        from_dir_config_key = from_dir_disp_key.replace("From ", "").lower()
+        possible_to_dirs_for_from_disp = [f"To {get_display_direction(d)}" for d in VALID_MOVEMENTS.get(from_dir_config_key, []) if d != from_dir_config_key]
+        if not possible_to_dirs_for_from_disp: continue
+
+        multi_cols = pd.MultiIndex.from_product(
+            [possible_to_dirs_for_from_disp, all_vehicle_types_ordered + ['TOTAL']],
+            names=['direction_to', 'vehicle_type']
+        )
+        aggregated_counts[from_dir_disp_key] = pd.DataFrame(0, index=pd.Index(intervals_24h_labels, name='TIME'), columns=multi_cols).sort_index(axis=1)
+
+
+    for i, report_file in enumerate(chunk_report_files):
+        print(f"Consolidating data from: {os.path.basename(report_file)} ({i+1}/{len(chunk_report_files)})")
+        try:
+            xls = pd.ExcelFile(report_file)
+            # Vehicle Logs
+            if 'Vehicle Logs' in xls.sheet_names:
+                all_log_dfs.append(pd.read_excel(xls, sheet_name='Vehicle Logs'))
+            # Intervals (take from first, assume same for all chunks of the same day)
+            if interval_df_final is None and 'Intervals' in xls.sheet_names:
+                interval_df_final = pd.read_excel(xls, sheet_name='Intervals')
+            # Directional Counts
+            for sheet_name in xls.sheet_names:
+                if sheet_name.startswith("From ") and sheet_name in aggregated_counts:
+                    chunk_df = pd.read_excel(xls, sheet_name=sheet_name, header=[1, 2], index_col=0) # Header is 2 levels, index is TIME
+                    chunk_df.index.name = 'TIME'
+                    # Ensure all columns from master template exist, fill missing with 0
+                    # Reindex to match the master 24h interval list
+                    chunk_df = chunk_df.reindex(index=intervals_24h_labels, fill_value=0)
+                    chunk_df = chunk_df.reindex(columns=aggregated_counts[sheet_name].columns, fill_value=0).sort_index(axis=1)
+                    aggregated_counts[sheet_name] = aggregated_counts[sheet_name].add(chunk_df, fill_value=0)
+
+            # RSA Output
+            if 'RSA Output' in xls.sheet_names:
+                rsa_sheet_df = pd.read_excel(xls, sheet_name='RSA Output', header=None)
+                if rsa_header_lines is None: # Store header from first file
+                    rsa_header_lines = rsa_sheet_df.iloc[:6].values.tolist() # Assuming 6 header lines
+                all_rsa_data_lines.extend(rsa_sheet_df.iloc[6:].values.tolist()) # Data lines
+        except Exception as e:
+            print(f"Warning: Could not fully process {os.path.basename(report_file)}: {e}")
+
+    # --- Write Final Consolidated Report ---
+    print(f"Writing consolidated report to: {final_output_path}")
+    os.makedirs(os.path.dirname(final_output_path), exist_ok=True)
+    try:
+        with pd.ExcelWriter(final_output_path, engine='xlsxwriter') as writer:
+            workbook = writer.book # For formatting later if needed
+            # Write Consolidated Vehicle Logs
+            if all_log_dfs:
+                final_log_df = pd.concat(all_log_dfs, ignore_index=True)
+                final_log_df.to_excel(writer, sheet_name='Vehicle Logs', index=False)
+                print(f"Consolidated 'Vehicle Logs': {len(final_log_df)} rows.")
+            # Write Intervals (taken from first valid report)
+            if interval_df_final is not None:
+                interval_df_final.to_excel(writer, sheet_name='Intervals', index=False)
+                print("Wrote 'Intervals' sheet.")
+            # Write Aggregated Directional Counts
+            for sheet_name, df_agg in aggregated_counts.items():
+                if not df_agg.empty:
+                     # Reset index to write 'TIME' as a column
+                    df_agg.reset_index().to_excel(writer, sheet_name=sheet_name, index=False)
+                    debug_print(f"Wrote aggregated '{sheet_name}'.")
+                # Manual header writing logic from create_excel_report could be adapted here if complex headers are needed.
+                # For simplicity now, default pandas multi-header write is used.
+
+            # Write Consolidated RSA Output
+            if rsa_header_lines and all_rsa_data_lines:
+                final_rsa_lines = rsa_header_lines + all_rsa_data_lines
+                df_rsa_final = pd.DataFrame(final_rsa_lines)
+                df_rsa_final.to_excel(writer, sheet_name='RSA Output', index=False, header=False)
+                print(f"Consolidated 'RSA Output': {len(all_rsa_data_lines)} data rows.")
+        print(f"Consolidated report saved: {final_output_path}")
+        return final_output_path
+    except Exception as e:
+        print(f"Error writing consolidated Excel report: {e}")
+        import traceback; traceback.print_exc()
+        return None
