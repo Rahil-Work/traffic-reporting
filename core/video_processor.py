@@ -758,7 +758,7 @@ class VideoProcessor:
                     final_outcome_message = full_summary
                     yield "Orchestrator: Report consolidation successful."
                     # Optional: Clean up temp report dir
-                    # shutil.rmtree(REPORT_TEMP_DIR)
+                    shutil.rmtree(REPORT_TEMP_DIR)
                 else:
                     final_outcome_message = f"⚠️ Processing finished, but report consolidation failed. Chunk reports in {REPORT_TEMP_DIR}."
                     yield "Orchestrator: Report consolidation failed."
