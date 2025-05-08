@@ -66,6 +66,7 @@ PARALLEL_STREAMS = 16 if PROCESSING_MODE == 'enhanced' else 2
 REIDENTIFICATION_TIMEOUT = 10.0
 MAX_MATCHING_DISTANCE = 50
 TRACKER_CONFIG = ''
+TRACKER_TYPE = 'Custom'
 
 # --- Auto Chunking for Long Videos ---
 ENABLE_AUTO_CHUNKING = True        # Set to True to enable automatic chunking

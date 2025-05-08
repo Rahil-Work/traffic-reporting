@@ -8,6 +8,7 @@ import subprocess # For ffmpeg
 import shutil # For directory cleanup
 import glob # For finding chunk files
 import psutil
+import cv2
 
 def debug_print(message):
     """Print debug messages only when DEBUG_MODE is enabled."""
@@ -133,7 +134,7 @@ def get_video_properties(video_path):
             # Fallback to ffprobe if OpenCV fails for duration/fps
             try:
                 ffprobe_cmd = [
-                    'ffprobe', -v', 'error', '-select_streams', 'v:0',
+                    'ffprobe', '-v', 'error', '-select_streams', 'v:0',
                     '-show_entries', 'stream=duration,r_frame_rate,nb_frames',
                     '-of', 'default=noprint_wrappers=1:nokey=1', str(video_path)
                 ]

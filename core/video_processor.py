@@ -6,14 +6,9 @@ import time
 import os
 import threading
 import queue
-import gc
 import shutil # For directory cleanup
-import math # For ceiling function
-import subprocess # For ffmpeg muxing if needed by writer
 from datetime import datetime, timedelta
-from pathlib import Path # For paths
 import concurrent.futures
-from concurrent.futures import ThreadPoolExecutor
 import re
 
 # Configuration
@@ -27,15 +22,15 @@ from config import (
     ENABLE_AUTO_CHUNKING, AUTO_CHUNK_THRESHOLD_MINUTES,
     AUTO_CHUNK_DURATION_MINUTES, CHUNK_TEMP_DIR, REPORT_TEMP_DIR,
     FFMPEG_PATH, ENCODER_CODEC, ENCODER_BITRATE, ENCODER_PRESET,
-    RAW_STREAM_FILENAME, FINAL_VIDEO_EXTENSION, REPORT_OUTPUT_DIR, # Make sure REPORT_OUTPUT_DIR is imported
+    FINAL_VIDEO_EXTENSION, REPORT_OUTPUT_DIR, # Make sure REPORT_OUTPUT_DIR is imported
     # Tracker Type (though deferred)
     TRACKER_TYPE #, STRONGSORT_WEIGHTS_PATH # Add if/when using StrongSORT/BoxMOT
 )
 
 # Modules
-from utils import (debug_print, format_timestamp, is_valid_movement,
+from core.utils import (debug_print, format_timestamp, is_valid_movement,
                     cleanup_memory, get_video_properties, split_video_ffmpeg)
-from performance import PerformanceTracker
+from core.performance import PerformanceTracker
 from models.model_loader import load_model, get_device
 
 # Import tracker based on config OR default to VehicleTracker
@@ -55,10 +50,11 @@ add_gpu_overlays = None
 if ENABLE_VISUALIZATION:
     try:
         from visualization.gpu_overlay import add_gpu_overlays
-        from .nvidia_reader import NvidiaFrameReader
-        from .nvidia_writer import NvidiaFrameWriter
+        from core.nvidia_reader import NvidiaFrameReader
+        from core.nvidia_writer import NvidiaFrameWriter
         GPU_VIZ_ENABLED = True
     except ImportError as e:
+        import traceback; traceback.print_exc()
         print(f"Warning: Failed to import GPU Reader/Writer/Overlay components ({e}).")
         print("If ENABLE_VISUALIZATION is True, will attempt CPU fallback for visualization (slower).")
         # Fallback to CPU visualization method (original overlay)

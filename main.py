@@ -9,9 +9,17 @@ from config import (
 from core.utils import setup_torch_global_settings, setup_thread_affinity
 
 if LINE_MODE == 'interactive':
-    from interface.gradio_app import create_interface
-else:
+    try:
+        from core.video_processor import VideoProcessor
+        from interface.gradio_app import create_interface
+        GRADIO_AVAILABLE = True
+    except ImportError as e:
+        print(f"Warning: Gradio or core components not found, interactive mode may fail: {e}")
+        create_interface = None
+        GRADIO_AVAILABLE = False
+else: # hardcoded mode
     from core.video_processor import VideoProcessor
+    GRADIO_AVAILABLE = False
     create_interface = None
 
 # --- Main Execution Logic ---
@@ -25,8 +33,8 @@ def run_app():
 
     if LINE_MODE == 'interactive':
         # --- Run Gradio Interface ---
-        if create_interface is None:
-             print("ERROR: Gradio components not loaded.", file=sys.stderr); sys.exit(1)
+        if not GRADIO_AVAILABLE or create_interface is None:
+             print("ERROR: Gradio components not loaded or failed to import.", file=sys.stderr); sys.exit(1)
         try:
             print("\nStarting Gradio interface for interactive setup...")
             interface = create_interface()
@@ -45,17 +53,34 @@ def run_app():
         print(f"Using Input Video: {INPUT_VIDEO_PATH}")
         print(f"Using Start Date:  {START_DATE}")
         print(f"Using Start Time:  {START_TIME}")
+        print(f"Using Primary Direction: {DEFAULT_PRIMARY_DIRECTION}")
 
         try:
             processor = VideoProcessor()
-            result_message = processor.process_video(
+            if processor is None or processor.model is None:
+                print("ERROR: VideoProcessor not initialized or model failed to load.", file=sys.stderr)
+                sys.exit(1)
+            
+            print("\n--- Processing Started ---")
+            final_result_message = "Processing did not complete."
+
+            for status_update in processor.process_video(
                 video_path=INPUT_VIDEO_PATH,
                 start_date_str=START_DATE,
                 start_time_str=START_TIME,
-                primary_direction=DEFAULT_PRIMARY_DIRECTION
-            )
+                primary_direction=DEFAULT_PRIMARY_DIRECTION.lower() # Pass lowercase
+            ):
+                if isinstance(status_update, str):
+                    # Print intermediate status updates from the processor
+                    print(f"STATUS: {status_update}")
+                elif isinstance(status_update, dict) and 'final_message' in status_update:
+                    # Store the final message when received
+                    final_result_message = status_update['final_message']
+                    # No break needed here, let generator finish naturally
+                else:
+                    print(f"Received unexpected status: {status_update}")
             print("\n--- Processing Result ---")
-            print(result_message)
+            print(final_result_message) # Print the final comprehensive message
             print("-------------------------")
         except Exception as e:
             print(f"\n--- ERROR during hardcoded processing ---", file=sys.stderr)
