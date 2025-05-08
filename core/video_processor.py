@@ -2,6 +2,7 @@
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 import time
 import os
 import threading
@@ -10,6 +11,7 @@ import shutil # For directory cleanup
 from datetime import datetime, timedelta
 import concurrent.futures
 import re
+import kornia.color as K
 
 # Configuration
 from config import (
@@ -22,9 +24,8 @@ from config import (
     ENABLE_AUTO_CHUNKING, AUTO_CHUNK_THRESHOLD_MINUTES,
     AUTO_CHUNK_DURATION_MINUTES, CHUNK_TEMP_DIR, REPORT_TEMP_DIR,
     FFMPEG_PATH, ENCODER_CODEC, ENCODER_BITRATE, ENCODER_PRESET,
-    FINAL_VIDEO_EXTENSION, REPORT_OUTPUT_DIR, # Make sure REPORT_OUTPUT_DIR is imported
-    # Tracker Type (though deferred)
-    TRACKER_TYPE #, STRONGSORT_WEIGHTS_PATH # Add if/when using StrongSORT/BoxMOT
+    FINAL_VIDEO_EXTENSION, REPORT_OUTPUT_DIR,
+    TRACKER_TYPE
 )
 
 # Modules
@@ -46,22 +47,50 @@ NvidiaFrameReader = None
 NvidiaFrameWriter = None
 add_gpu_overlays = None
 
-# Use GPU Overlays if Visualizing with Nvidia Writer
+try:
+    from core.nvidia_reader import NvidiaFrameReader
+    print("Imported NvidiaFrameReader.")
+except ImportError as e_reader:
+    print(f"Warning: Failed to import NvidiaFrameReader ({e_reader}). GPU accelerated reading disabled.")
+    NvidiaFrameReader = None # Ensure it's None if import fails
+
+# --- Conditional import for Writer and Overlay based on Visualization ---
 if ENABLE_VISUALIZATION:
-    try:
-        from visualization.gpu_overlay import add_gpu_overlays
-        from core.nvidia_reader import NvidiaFrameReader
-        from core.nvidia_writer import NvidiaFrameWriter
-        GPU_VIZ_ENABLED = True
-    except ImportError as e:
-        import traceback; traceback.print_exc()
-        print(f"Warning: Failed to import GPU Reader/Writer/Overlay components ({e}).")
-        print("If ENABLE_VISUALIZATION is True, will attempt CPU fallback for visualization (slower).")
-        # Fallback to CPU visualization method (original overlay)
-        from visualization import overlay as visual_overlay
+    if NvidiaFrameReader is not None: # Only try writer/overlay if reader worked
+        try:
+            from visualization.gpu_overlay import add_gpu_overlays
+            from core.nvidia_writer import NvidiaFrameWriter
+            GPU_VIZ_ENABLED = True
+            print("GPU Writer & Overlay components imported successfully.")
+        except ImportError as e_viz:
+            import traceback; traceback.print_exc()
+            print(f"Warning: Failed to import GPU Writer/Overlay components ({e_viz}).")
+            print("Visualization will be disabled.")
+            GPU_VIZ_ENABLED = False
+            add_gpu_overlays = None
+            NvidiaFrameWriter = None
+            # Import CPU fallback overlay if needed elsewhere
+            # from visualization import overlay as visual_overlay
+    else:
+        # Reader failed to import, so GPU viz is impossible
+        print("NvidiaFrameReader failed to import, disabling GPU Visualization.")
+        GPU_VIZ_ENABLED = False
+        # Import CPU fallback overlay if needed elsewhere
+        # from visualization import overlay as visual_overlay
 else:
     print("ENABLE_VISUALIZATION is False. No video output will be generated.")
-    from visualization import overlay as visual_overlay # Needed for add_status_overlay even if video isn't written
+    # Import CPU fallback overlay if needed elsewhere
+    # from visualization import overlay as visual_overlay
+
+USE_CPU_READER_FALLBACK = False # Set to True if you want cv2.VideoCapture as fallback
+if NvidiaFrameReader is None and not USE_CPU_READER_FALLBACK:
+     # Raise an error or exit if Nvidia reading is essential
+     raise ImportError("NvidiaFrameReader failed to import and CPU fallback is disabled.")
+elif NvidiaFrameReader is None and USE_CPU_READER_FALLBACK:
+     print("Using CPU Frame Reader (cv2.VideoCapture) as fallback.")
+     # Ensure the rest of the code handles the case where self.reader_instance is None
+     # and uses self._frame_reader_task (CPU version) instead.
+     # This requires changes in _process_single_video_file to switch reader logic.
 
 # Conditional imports
 if ENABLE_DETAILED_PERFORMANCE_METRICS:
@@ -330,36 +359,149 @@ class VideoProcessor:
 
     # --- Core Processing Logic ---
     @torch.no_grad()
-    def _preprocess_batch(self, frame_tensor_list):
-        """ Prepares a batch from a list of frame tensors already on the GPU. """
-        if not frame_tensor_list: return None
-        processed_tensors = []
-        target_h, target_w = self.model_input_size_config, self.model_input_size_config
-
-        for frame_tensor in frame_tensor_list:
-            if frame_tensor is None: continue
-            if str(frame_tensor.device) != str(self.device):
-                frame_tensor = frame_tensor.to(self.device)
-
-            # Assuming frame_tensor is [C, H, W] from NvidiaReader
-            _, current_h, current_w = frame_tensor.shape
-            if current_h != target_h or current_w != target_w:
-                frame_tensor = F.interpolate(
-                    frame_tensor.unsqueeze(0), size=(target_h, target_w),
-                    mode='bilinear', align_corners=False
-                ).squeeze(0)
-            processed_tensors.append(frame_tensor)
-
-        if not processed_tensors: return None
-        batch_tensor = torch.stack(processed_tensors)
-        dtype = torch.float16 if (MIXED_PRECISION and self.device == 'cuda') else torch.float32
+    def _preprocess_batch(self, current_batch_of_gpu_tensors_from_reader):
+        """
+        Prepares a batch for model inference and visualization.
+        Input: List of raw GPU tensors from NvidiaFrameReader (expected to represent NV12).
+        Output: ARGB batch tensor [B, 4, H_model, W_model], float, range [0,1]
+                (where H_model, W_model are MODEL_INPUT_SIZE)
+        """
+        if not current_batch_of_gpu_tensors_from_reader:
+            log_prefix = getattr(self, 'thread_name_prefix', 'Preproc')
+            print(f"{log_prefix}: Empty input tensor list.")
+            return None
         
-        # Assuming NvidiaReader provides tensors in [0, 255] range. Normalize if needed.
-        # If reader provides float [0,1], then this division is not needed.
-        # For now, let's assume PyNvDecoder outputs uint8 surfaces, converted to tensors,
-        # so they are effectively [0,255] range before this.
-        batch_tensor = batch_tensor.to(dtype) / 255.0
-        return batch_tensor
+        processed_argb_tensors_for_batch = []
+        target_h_model, target_w_model = self.model_input_size_config, self.model_input_size_config
+        log_prefix = getattr(self, 'thread_name_prefix', 'Preproc') # For logging consistency
+
+        # Ensure reader dimensions are available (should be set by now)
+        if not (hasattr(self.reader_instance, 'width') and self.reader_instance.width > 0 and \
+                hasattr(self.reader_instance, 'height') and self.reader_instance.height > 0):
+            print(f"{log_prefix}: Reader dimensions not yet available for NV12 conversion. Cannot process batch.")
+            return None
+        
+        original_h = self.reader_instance.height
+        original_w = self.reader_instance.width
+
+        # Check if dimensions are divisible by 2 (required by yuv420_to_rgb)
+        if original_h % 2 != 0 or original_w % 2 != 0:
+            print(f"{log_prefix}: CRITICAL - Original video dimensions ({original_w}x{original_h}) "
+                  f"are not evenly divisible by 2. Kornia YUV420 conversion will likely fail. "
+                  f"Consider preprocessing videos to have even dimensions or adding padding/cropping.")
+            # Depending on requirements, you might try to crop here, but it's complex. Best to fix input videos.
+            # Returning None for now.
+            return None
+
+        for idx, raw_nv12_tensor in enumerate(current_batch_of_gpu_tensors_from_reader):
+            if raw_nv12_tensor is None: continue
+            
+            if str(raw_nv12_tensor.device) != str(self.device):
+                raw_nv12_tensor = raw_nv12_tensor.to(self.device)
+
+            # --- NV12 to RGB Conversion using kornia.color.yuv420_to_rgb ---
+            # Debug print for the first frame's input tensor
+            if idx == 0: 
+                print(f"Debug Preproc (Frame 0): raw_nv12_tensor shape: {raw_nv12_tensor.shape}, dtype: {raw_nv12_tensor.dtype}")
+
+            # Step 1: Validate shape and dtype (expecting uint8, (H*1.5, W) from dlpack)
+            if raw_nv12_tensor.ndim != 2 or raw_nv12_tensor.shape != (int(original_h * 1.5), original_w):
+                print(f"{log_prefix}: Unexpected raw_nv12_tensor shape: {raw_nv12_tensor.shape} for frame index {idx}. "
+                      f"Expected (H*1.5, W) = ({int(original_h * 1.5)}, {original_w}). Skipping frame.")
+                continue
+                
+            if raw_nv12_tensor.dtype != torch.uint8:
+                print(f"{log_prefix}: Warning (frame index {idx}) - NV12 tensor dtype is {raw_nv12_tensor.dtype}, expected torch.uint8. Skipping frame (conversion may be needed earlier or check reader).")
+                # It's crucial that the input tensor is uint8 [0,255] before separating planes.
+                continue
+
+            # Step 2: Separate Y and UV planes
+            try:
+                # Y plane is the first H rows
+                y_plane = raw_nv12_tensor[:original_h, :] # Shape: [H, W]
+                # UV plane is the remaining H/2 rows, containing interleaved UV data
+                uv_plane_interleaved = raw_nv12_tensor[original_h:, :] # Shape: [H/2, W]
+
+                # Step 3: De-interleave UV plane and reshape
+                # NV12 format: U V U V ...
+                # Reshape to [H/2, W/2, 2] -> channel dimension stores U and V
+                uv_plane_deinterleaved = uv_plane_interleaved.reshape(original_h // 2, original_w // 2, 2)
+                
+                # Separate U and V. Kornia expects UV together as [B, 2, H/2, W/2]
+                # Permute to [2, H/2, W/2]
+                uv_plane_permuted = uv_plane_deinterleaved.permute(2, 0, 1) # Shape: [2, H/2, W/2]
+
+                # Step 4: Add Batch and Channel dimensions, convert Y to float [0,1], UV to float [-0.5, 0.5]
+                # Kornia's yuv420_to_rgb expects Y in [0,1] and UV in [-0.5, 0.5]
+                y_plane_final = y_plane.float().unsqueeze(0).unsqueeze(0) / 255.0 # Shape: [1, 1, H, W], Range [0,1]
+                
+                # Convert UV uint8 [0,255] to float [-0.5, 0.5] range expected by Kornia
+                # Formula: float = (uint8 / 255.0) - 0.5 (approximately, exact range might depend on standard)
+                # Or more precisely: Y range 16-235, UV range 16-240 -> map to float ranges.
+                # Let's use the simple scaling first, Kornia might handle standard ranges internally.
+                # uv_plane_final = (uv_plane_permuted.float() / 255.0) - 0.5 # Incorrect range mapping potentially
+                
+                # Kornia often works with YCbCr values directly. Let's try passing uint8 Y and uint8 UV
+                # and see if yuv420_to_rgb handles the conversion internally, OR convert to float and scale later.
+                # Trying with float inputs scaled simply:
+                # Y: [0, 1]
+                # UV: Convert uint8 [0, 255] to float [0, 1] first, Kornia might handle the range shift.
+                # Or check docs if it expects specific integer ranges.
+                # Safest bet might be to convert RGB->YUV420 in Kornia to see expected input ranges.
+                
+                # Let's assume yuv420_to_rgb takes Y [0,1] and UV [0,1] (from uint8/255) and handles offsets internally.
+                y_plane_input = y_plane.unsqueeze(0).unsqueeze(0).float() / 255.0 # [1, 1, H, W]
+                uv_plane_input = uv_plane_permuted.unsqueeze(0).float() / 255.0 # [1, 2, H/2, W/2]
+
+            except Exception as e_reshape:
+                print(f"{log_prefix}: Error separating/reshaping YUV planes for frame index {idx}: {e_reshape}. Skipping frame.")
+                continue
+
+            # Step 5: Convert YUV420 to RGB using Kornia
+            try:
+                frame_tensor_rgb_k = K.yuv420_to_rgb(y_plane_input, uv_plane_input) # Input: Y[B,1,H,W], UV[B,2,H/2,W/2] (float [0,1])
+                # Output: [B, 3, H, W], float32 [0,1]
+                if frame_tensor_rgb_k is None: raise RuntimeError("kornia.color.yuv420_to_rgb returned None")
+                frame_tensor_rgb = frame_tensor_rgb_k.squeeze(0) # Remove batch dim -> [3, H_original, W_original]
+
+            except Exception as e_conv:
+                print(f"{log_prefix}: Error during yuv420_to_rgb conversion for frame index {idx}: {e_conv}. Skipping frame.")
+                import traceback; traceback.print_exc() # Print stack trace for Kornia errors
+                continue
+
+            # frame_tensor_rgb is now [3, H_original, W_original], float32, range [0,1]
+
+            # Step 6: Add Alpha channel to make it ARGB (Alpha first)
+            _c, current_h, current_w = frame_tensor_rgb.shape
+            alpha_channel = torch.ones((1, current_h, current_w), dtype=frame_tensor_rgb.dtype, device=frame_tensor_rgb.device)
+            # Create ARGB: Alpha, R, G, B
+            frame_tensor_argb = torch.cat((alpha_channel, frame_tensor_rgb), dim=0) # [4, H_original, W_original]
+
+            # Step 7: Resize to model input size
+            if current_h != target_h_model or current_w != target_w_model:
+                try:
+                    frame_tensor_argb_resized = F.interpolate(
+                        frame_tensor_argb.unsqueeze(0), size=(target_h_model, target_w_model),
+                        mode='bilinear', align_corners=False
+                    ).squeeze(0) # [4, H_model, W_model]
+                except Exception as e_resize:
+                    print(f"{log_prefix}: Error during resize for frame index {idx}: {e_resize}. Skipping frame.")
+                    continue
+            else:
+                frame_tensor_argb_resized = frame_tensor_argb
+            
+            processed_argb_tensors_for_batch.append(frame_tensor_argb_resized)
+
+        # --- Batch Post-processing ---
+        if not processed_argb_tensors_for_batch:
+            print(f"{log_prefix}: No tensors were successfully processed in this batch.")
+            return None
+            
+        # Stack processed tensors into a batch
+        # Output is ARGB, float32, [0,1], resized to model_input_size
+        final_batch_tensor_argb = torch.stack(processed_argb_tensors_for_batch)
+        
+        return final_batch_tensor_argb
 
     def _process_inference_results(self, results_yolo, input_batch_tensor_for_viz, frame_numbers, frame_times, start_datetime_chunk):
         """
@@ -799,174 +941,284 @@ class VideoProcessor:
 
     # --- Core Processing Logic for ONE file/chunk ---
     def _process_single_video_file(self, video_path, start_date_str, start_time_str, primary_direction, output_path_override=None, progress_callback=None, chunk_info=(1,1)):
-        """ Processes a single video file (original or chunk) using Nvidia Reader/Writer. """
-        print(f"_process_single_video_file: Initializing for {os.path.basename(video_path)}")
-        # --- State Reset ---
-        if self.tracker_type_internal == 'Custom':
-            self.tracker = VehicleTracker()
-        # Add other tracker initializations here if TRACKER_TYPE changes
-        # else: raise NotImplementedError(f"Tracker type {self.tracker_type_internal} not fully implemented for reset.")
-        self.zone_tracker = None
-        self.perf = PerformanceTracker(enabled=ENABLE_DETAILED_PERFORMANCE_METRICS)
-        self.stop_event = threading.Event()
+        """ Processes a single video file (original or chunk) using Nvidia Reader/Writer if enabled. """
+        base_video_name = os.path.basename(video_path)
+        print(f"_process_single_video_file: Initializing for {base_video_name}")
+
+        # Determine if GPU acceleration is enabled for this run
+        _viz_enabled_this_run = ENABLE_VISUALIZATION and GPU_VIZ_ENABLED
+        writer_initialized_this_run = False # Track if writer init was attempted
+
+        # --- Per-File/Chunk State Initialization ---
+        self.tracker = None # Initialize tracker instance
+        self.zone_tracker = None # Initialize zone tracker instance
+        self.perf = PerformanceTracker(enabled=ENABLE_DETAILED_PERFORMANCE_METRICS) # New performance tracker
+        self.stop_event = threading.Event() # Event to signal threads to stop
+        self.reader_dimensions_ready_event = threading.Event() # Event for reader->main sync
         self.last_cleanup_time = time.monotonic()
-        self.detection_zones_polygons = None
-        self.writer_instance = None
-        self.reader_thread = None
-        self.final_output_path_current_file = None # For this chunk's video output
+        self.detection_zones_polygons = None # Zones used for this run
+        self.writer_instance = None # Holds NvidiaFrameWriter instance
+        self.reader_instance = None # Holds NvidiaFrameReader instance
+        self.reader_thread = None # Holds reader thread object
+        self.final_output_path_current_file = None # Path to the final muxed video for this file/chunk
+        self.frame_read_queue = None # Queue for reader output
 
         try:
             # --- Parse Start Datetime for this chunk/file ---
-            dt_str = f"{start_date_str}{start_time_str[:6]}"; base_dt = datetime.strptime(dt_str, "%y%m%d%H%M%S")
-            start_datetime_chunk = base_dt.replace(microsecond=int(start_time_str[6:].ljust(6, '0')))
+            try:
+                dt_str = f"{start_date_str}{start_time_str[:6]}"
+                base_dt = datetime.strptime(dt_str, "%y%m%d%H%M%S")
+                start_datetime_chunk = base_dt.replace(microsecond=int(start_time_str[6:].ljust(6, '0')))
+                print(f"_process_single_video_file: Parsed start datetime: {start_datetime_chunk.isoformat()}")
+            except ValueError as e_dt:
+                 raise ValueError(f"Invalid start date/time format '{start_date_str} {start_time_str}': {e_dt}") from e_dt
 
-            # --- Zone Setup ---
+            # --- Zone Setup (Hardcoded or Interactive) ---
+            print(f"_process_single_video_file: Setting up zones (mode: {self.line_mode})...")
             if self.line_mode == 'hardcoded':
-                # ... (your existing hardcoded zone loading logic from original process_video) ...
-                 if not LINE_POINTS: raise ValueError("Config LINE_POINTS missing")
+                 if not LINE_POINTS: raise ValueError("Config LINE_POINTS missing for hardcoded mode.")
                  valid_polys = {k: v for k, v in LINE_POINTS.items() if isinstance(v, list) and len(v) >= 3}
-                 if not valid_polys: raise ValueError("No valid polygons in config LINE_POINTS")
+                 if not valid_polys: raise ValueError("No valid polygons found in config LINE_POINTS.")
                  self.detection_zones_polygons = {k: np.array(v, dtype=np.int32) for k, v in valid_polys.items()}
             elif self.line_mode == 'interactive':
-                # ... (your existing interactive zone loading logic using self.gradio_polygons) ...
-                 if not self.gradio_polygons: raise ValueError("Gradio polygons not defined")
+                 if not self.gradio_polygons: raise ValueError("Gradio polygons not defined for interactive mode.")
                  valid_polys = {k: v for k, v in self.gradio_polygons.items() if v and len(v) >= 3}
-                 if len(valid_polys) < 2: raise ValueError("Need >= 2 valid Gradio zones")
+                 if len(valid_polys) < 2: raise ValueError("Need at least 2 valid Gradio zones defined.")
                  self.detection_zones_polygons = {k: np.array(v, dtype=np.int32) for k, v in valid_polys.items()}
+            else:
+                 raise ValueError(f"Invalid LINE_MODE configured: {self.line_mode}")
+
             self.zone_tracker = ZoneTracker(self.detection_zones_polygons)
-            if not self.zone_tracker or not self.zone_tracker.zones: raise RuntimeError("ZoneTracker init failed")
-            print(f"ZoneTracker initialized with {len(self.zone_tracker.zones)} zones for {os.path.basename(video_path)}.")
+            if not self.zone_tracker or not self.zone_tracker.zones: raise RuntimeError("ZoneTracker initialization failed.")
+            print(f"ZoneTracker initialized with {len(self.zone_tracker.zones)} zones: {list(self.zone_tracker.zones.keys())}")
+
+            # --- Initialize Tracker ---
+            print(f"_process_single_video_file: Initializing tracker (type: {self.tracker_type_internal})...")
+            if self.tracker_type_internal == 'Custom':
+                self.tracker = VehicleTracker() # Use configured parameters if needed
+            # Add elif blocks for other tracker types here
+            else:
+                raise NotImplementedError(f"Tracker type {self.tracker_type_internal} not fully implemented in _process_single_video_file.")
+            if self.tracker is None: raise RuntimeError("Tracker initialization failed.")
+            print("Tracker initialized.")
 
 
             # --- Get Video Properties for the current file ---
+            print(f"_process_single_video_file: Getting video properties for {base_video_name}...")
             duration_sec_file, original_fps_file, total_frames_file = get_video_properties(video_path)
-            if duration_sec_file is None: raise FileNotFoundError(f"Cannot open or read properties: {video_path}")
-            if original_fps_file <= 0: original_fps_file = 30.0
+            if duration_sec_file is None: raise FileNotFoundError(f"Cannot open or read video properties for: {video_path}")
+            if original_fps_file <= 0:
+                print(f"Warning: Original FPS read as {original_fps_file}. Using default 30.0.")
+                original_fps_file = 30.0
+            print(f"Video Properties: Duration={duration_sec_file:.2f}s, OrigFPS={original_fps_file:.2f}, TotalFrames~={total_frames_file}")
 
-            # --- Setup Reader Thread (NvidiaFrameReader) ---
-            self.frame_read_queue = queue.Queue(maxsize=self.batch_size * 4)
-            # Assuming NvidiaFrameReader is globally imported or in self
+            # --- Setup and Start Reader Thread (NvidiaFrameReader) ---
+            print(f"_process_single_video_file: Setting up NvidiaFrameReader...")
+            self.frame_read_queue = queue.Queue(maxsize=self.batch_size * 4) # Queue for (tensor, frame_num, timestamp)
             self.reader_instance = NvidiaFrameReader(
-                video_path, self.target_fps, original_fps_file,
-                self.frame_read_queue, self.stop_event, device_id=0 # Assuming GPU 0
+                video_path=video_path,
+                target_fps=self.target_fps,
+                original_fps_hint=original_fps_file,
+                frame_queue=self.frame_read_queue,
+                stop_event=self.stop_event,
+                dimensions_ready_event=self.reader_dimensions_ready_event, # Pass the event
+                device_id_for_torch_output=0 # Assuming device 0
+                # Pass cuda_context_handle/cuda_stream_handle if managed externally
             )
-            # Wait for reader to initialize and get dims (important for writer)
-            if not self.reader_instance._initialize_decoder(): # Call protected method - might need refactor
-                raise RuntimeError("NvidiaReader failed to initialize its decoder.")
-            reader_w, reader_h = self.reader_instance.width, self.reader_instance.height
-            self.reader_thread = threading.Thread(target=self.reader_instance.run, daemon=True); self.reader_thread.start()
-
-            # --- Setup Writer Thread (NvidiaFrameWriter if GPU_VIZ_ENABLED) ---
-            _viz_enabled_this_run = ENABLE_VISUALIZATION and GPU_VIZ_ENABLED
-            if _viz_enabled_this_run:
-                # Define final output path for THIS chunk's video
-                chunk_video_base = f"output_{os.path.splitext(os.path.basename(video_path))[0]}"
-                final_muxed_path = os.path.join(VIDEO_OUTPUT_DIR, f"{chunk_video_base}{FINAL_VIDEO_EXTENSION}")
-                os.makedirs(VIDEO_OUTPUT_DIR, exist_ok=True)
-
-                self.writer_instance = NvidiaFrameWriter(
-                    output_path=final_muxed_path, width=reader_w, height=reader_h,
-                    fps=self.target_fps, # Output video at target FPS
-                    codec=ENCODER_CODEC, bitrate=ENCODER_BITRATE, preset=ENCODER_PRESET,
-                    temp_dir=CHUNK_TEMP_DIR, # Place raw stream in temp chunk dir
-                    device_id=0)
-                self.writer_instance.start()
-                print("Nvidia Writer thread started.")
-            else:
-                self.writer_instance = None
-                print("GPU Visualization/Writing disabled for this run.")
+            self.reader_thread = threading.Thread(target=self.reader_instance.run, name=f"NvidiaReader-{base_video_name}", daemon=True)
+            self.reader_thread.start()
+            print("NvidiaReader thread started. Main loop will wait for dimensions event before initializing writer.")
 
             # --- Main Processing Loop ---
-            all_detections_structured_log = [] # For this file's report
-            frames_processed_count = 0
+            all_detections_structured_log = [] # Stores dicts for Excel report for this file/chunk
+            frames_processed_count = 0          # Frames processed by inference/tracking
             if self.perf: self.perf.start_processing(total_frames_file)
 
-            frames_batch_gpu_tensors = [] # List to hold GPU tensors from reader
-            frame_numbers_batch_abs = []  # Absolute frame numbers from original video
-            frame_times_batch_abs = []    # Absolute time offsets from original video start
+            # Batch accumulation lists
+            frames_batch_gpu_tensors = [] # Holds raw tensors from reader queue
+            frame_numbers_batch_abs = []  # Absolute frame numbers corresponding to tensors
+            frame_times_batch_abs = []    # Absolute time offsets corresponding to tensors
 
             last_progress_print_time = time.monotonic()
             current_chunk_idx_disp, total_chunks_disp = chunk_info # For display
 
-            while True: # Main processing loop
-                try:
-                    frame_data = self.frame_read_queue.get(timeout=120) # Increased timeout
-                    if frame_data is None: self.frame_read_queue.task_done(); break # Reader done
-                    
-                    gpu_tensor, frame_num_abs, frame_time_abs = frame_data
-                    if gpu_tensor is None: self.frame_read_queue.task_done(); continue
+            processed_frame_indices_log = []
 
-                    frames_batch_gpu_tensors.append(gpu_tensor)
+            print(f"_process_single_video_file: Entering main processing loop for {base_video_name}...")
+            while True: # Loop until reader queue signals end (None)
+                try:
+                    # Get data from the reader thread's queue
+                    frame_data = self.frame_read_queue.get(timeout=120) # Long timeout
+                    
+                    if frame_data is None: # Check for EOS sentinel from reader
+                        if self.frame_read_queue: self.frame_read_queue.task_done() # Mark None as processed
+                        print(f"_process_single_video_file: Received EOS (None) from reader queue. Exiting processing loop.")
+                        break # Exit main loop
+
+                    # Unpack the data from the queue
+                    gpu_tensor_from_reader, frame_num_abs, frame_time_abs = frame_data
+                    if gpu_tensor_from_reader is None: # Should not happen if reader sends valid data or None
+                        if self.frame_read_queue: self.frame_read_queue.task_done()
+                        print(f"Warning: Received None tensor from reader queue unexpectedly (Frame {frame_num_abs}). Skipping.")
+                        continue
+
+                    # --- LAZY WRITER INITIALIZATION (using Event) ---
+                    # Attempt to initialize the writer only once if visualization is enabled
+                    if _viz_enabled_this_run and self.writer_instance is None and not writer_initialized_this_run:
+                        print(f"_process_single_video_file: Checking if writer needs initialization (Frame {frame_num_abs})...")
+                        # Wait for the reader to signal that dimensions are ready (or that it failed)
+                        print(f"Waiting for reader dimensions_ready_event...")
+                        event_was_set = self.reader_dimensions_ready_event.wait(timeout=10.0) # Wait up to 10s
+
+                        if event_was_set:
+                            # Event was set, check if reader successfully got dimensions
+                            reader_w = getattr(self.reader_instance, 'width', 0)
+                            reader_h = getattr(self.reader_instance, 'height', 0)
+
+                            if reader_w > 0 and reader_h > 0:
+                                print(f"Video dimensions ready: {reader_w}x{reader_h}. Initializing NvidiaFrameWriter...")
+                                chunk_video_base = f"output_{os.path.splitext(base_video_name)[0]}"
+                                final_muxed_path = os.path.join(VIDEO_OUTPUT_DIR, f"{chunk_video_base}{FINAL_VIDEO_EXTENSION}")
+                                os.makedirs(VIDEO_OUTPUT_DIR, exist_ok=True)
+                                
+                                # Determine format writer should expect (AFTER overlay drawing)
+                                # _preprocess_batch outputs ARGB float, overlay draws on it, then convert to UINT8 ARGB for writer
+                                writer_input_format = "ARGB" # String format name for PyNvVideoCodec
+
+                                self.writer_instance = NvidiaFrameWriter(
+                                    output_path=final_muxed_path, width=reader_w, height=reader_h,
+                                    fps=self.target_fps,
+                                    encoder_codec=ENCODER_CODEC, bitrate=ENCODER_BITRATE, preset=ENCODER_PRESET,
+                                    input_tensor_format_str=writer_input_format,
+                                    temp_dir=CHUNK_TEMP_DIR, device_id=0 # Assuming device 0 for encoder
+                                )
+                                self.writer_instance.start() # Starts writer thread, which calls _initialize_encoder
+
+                                # Check if the internal encoder object was created successfully
+                                if hasattr(self.writer_instance, 'encoder') and self.writer_instance.encoder is not None:
+                                    writer_initialized_this_run = True # Mark as successfully initialized
+                                    print("Nvidia Writer thread started successfully.")
+                                    self.final_output_path_current_file = final_muxed_path # Store potential output path
+                                else:
+                                    print("NvidiaWriter CRITICAL: _initialize_encoder failed inside writer thread. Writing disabled.")
+                                    self.writer_instance = None # Set back to None to prevent usage
+                                    writer_initialized_this_run = True # Mark as attempted (and failed)
+                            else:
+                                print(f"Reader dimensions event was set, but reader width/height still 0 (w={reader_w},h={reader_h}). "
+                                      "Reader initialization or parameter update likely failed. Writing disabled.")
+                                writer_initialized_this_run = True # Mark as attempted (and failed)
+                        else:
+                            print("Timeout waiting for reader dimensions_ready_event. Reader might be stuck or very slow. "
+                                  "Writing disabled for this run.")
+                            writer_initialized_this_run = True # Mark as attempted (and failed due to timeout)
+                    
+                    # --- Accumulate Batch ---
+                    frames_batch_gpu_tensors.append(gpu_tensor_from_reader)
                     frame_numbers_batch_abs.append(frame_num_abs)
                     frame_times_batch_abs.append(frame_time_abs)
 
+                    # --- Process Batch when Full ---
                     if len(frames_batch_gpu_tensors) >= self.batch_size:
+                        processed_frame_indices_log.extend(frame_numbers_batch_abs)
                         batch_start_mono = time.monotonic()
+                        # 1. Preprocess (NV12 -> ARGB float [0,1], resize)
                         if self.perf: self.perf.start_timer('preprocessing')
-                        input_batch_processed = self._preprocess_batch(frames_batch_gpu_tensors) # Input for YOLO
+                        batch_argb_for_viz_and_model = self._preprocess_batch(frames_batch_gpu_tensors)
                         if self.perf: self.perf.end_timer('preprocessing')
 
-                        if input_batch_processed is None or input_batch_processed.nelement() == 0:
-                            # print(f"Warning: Empty batch after preprocessing. Frame numbers: {frame_numbers_batch_abs}")
-                            frames_batch_gpu_tensors.clear(); frame_numbers_batch_abs.clear(); frame_times_batch_abs.clear()
-                            # Mark tasks done for consumed items
-                            for _ in range(len(frames_batch_gpu_tensors)): # This was old len, use new one
-                                try: self.frame_read_queue.task_done()
-                                except ValueError: break
-                            continue
+                        batch_log_entries = []
+                        batch_viz_data_for_gpu = []
+                        num_processed_in_batch = len(frames_batch_gpu_tensors) # Store length before clear
 
-                        # --- Inference ---
-                        stream = None # Handle self.streams if PARALLEL_STREAMS > 1
-                        if self.device == 'cuda' and self.streams: stream = self.streams[self.current_stream_index % len(self.streams)]; self.current_stream_index += 1
-                        
-                        with torch.cuda.stream(stream) if stream else torch.no_grad():
-                            with torch.amp.autocast(device_type=self.device, enabled=MIXED_PRECISION and self.device == 'cuda'):
-                                if self.perf and self.perf.start_event: self.perf.start_event.record(stream=stream)
-                                yolo_results = self.model(input_batch_processed, verbose=False)
-                                if self.perf and self.perf.end_event: self.perf.end_event.record(stream=stream)
-                        if stream: stream.synchronize()
-                        if self.perf and self.perf.start_event: self.perf.record_inference_time_gpu(self.perf.start_event, self.perf.end_event)
+                        if batch_argb_for_viz_and_model is not None and batch_argb_for_viz_and_model.nelement() > 0:
+                            # 2. Extract RGB for Model
+                            yolo_model_input = batch_argb_for_viz_and_model[:, 1:4, :, :] # Select R, G, B
 
-                        # --- Post-processing ---
-                        # Pass start_datetime_chunk which is absolute time for this chunk
-                        batch_log_entries, batch_viz_data_for_gpu = self._process_inference_results(
-                            yolo_results, input_batch_processed, frame_numbers_batch_abs, frame_times_batch_abs, start_datetime_chunk
-                        )
-                        all_detections_structured_log.extend(batch_log_entries)
-                        if self.perf: self.perf.record_detection(sum(len(r.boxes) for r in yolo_results if hasattr(r,'boxes') and r.boxes))
+                            # <<< Debug: Print tensor stats for a specific frame >>>
+                            TARGET_DEBUG_FRAME = 100 # Example frame number
+                            pipeline_name = "GPU" # Change to "CPU" when adding to CPU pipeline code
+                            if TARGET_DEBUG_FRAME in frame_numbers_batch_abs:
+                                try:
+                                    batch_index = frame_numbers_batch_abs.index(TARGET_DEBUG_FRAME)
+                                    tensor_to_debug = yolo_model_input[batch_index].detach().cpu() # Move to CPU for printing stats
+                                    print(f"\n--- Input Tensor Stats for Frame {TARGET_DEBUG_FRAME} ({pipeline_name} Pipeline) ---")
+                                    print(f"  Shape: {tensor_to_debug.shape}")
+                                    print(f"  Dtype: {tensor_to_debug.dtype}")
+                                    # Calculate stats carefully to avoid large tensor ops if possible
+                                    t_min = tensor_to_debug.min().item()
+                                    t_max = tensor_to_debug.max().item()
+                                    t_mean = tensor_to_debug.mean().item()
+                                    t_std = tensor_to_debug.std().item()
+                                    print(f"  Min:   {t_min:.6f}")
+                                    print(f"  Max:   {t_max:.6f}")
+                                    print(f"  Mean:  {t_mean:.6f}")
+                                    print(f"  Std:   {t_std:.6f}")
+                                    # Print a small slice (e.g., Top-left 3x3 pixels, all channels)
+                                    print("  Slice (Top-left 3x3, Channels 0,1,2):")
+                                    print(tensor_to_debug[:, :3, :3])
+                                    print("--- End Tensor Stats ---")
+                                except Exception as e_stat:
+                                    print(f"\nError getting tensor stats: {e_stat}")
+                            
+                            input()
 
-                        # --- GPU Visualization & Writing ---
-                        if _viz_enabled_this_run and self.writer_instance:
-                            if self.perf: self.perf.start_timer('drawing_gpu')
-                            # input_batch_processed is [B,C,H,W], float, normalized [0,1]
-                            # add_gpu_overlays should expect this format
-                            visualized_batch = add_gpu_overlays(
-                                input_batch_processed, batch_viz_data_for_gpu, self.zone_tracker.zones
+
+                            # 3. Inference
+                            stream = None
+                            if self.device == 'cuda' and self.streams: stream = self.streams[self.current_stream_index % len(self.streams)]; self.current_stream_index += 1
+                            with torch.cuda.stream(stream) if stream else torch.no_grad():
+                                with torch.amp.autocast(device_type=self.device, enabled=MIXED_PRECISION and self.device == 'cuda'):
+                                    if self.perf and self.perf.start_event: self.perf.start_event.record(stream=stream)
+                                    print(f"Debug VideoProcessor: Shape passed to model: {yolo_model_input.shape}, Dtype: {yolo_model_input.dtype}")
+                                    yolo_results = self.model(yolo_model_input, verbose=False) # Pass RGB
+                                    if self.perf and self.perf.end_event: self.perf.end_event.record(stream=stream)
+                            if stream: stream.synchronize()
+                            if self.perf and self.perf.start_event: self.perf.record_inference_time_gpu(self.perf.start_event, self.perf.end_event)
+
+                            # 4. Post-processing (Tracking, Zone Checks)
+                            # Pass RGB tensor results were based on, frame numbers/times, start datetime
+                            batch_log_entries, batch_viz_data_for_gpu = self._process_inference_results(
+                                yolo_results, yolo_model_input, frame_numbers_batch_abs, frame_times_batch_abs, start_datetime_chunk
                             )
-                            if self.perf: self.perf.end_timer('drawing_gpu')
+                            all_detections_structured_log.extend(batch_log_entries)
+                            if self.perf: self.perf.record_detection(sum(len(r.boxes) for r in yolo_results if hasattr(r,'boxes') and r.boxes))
 
-                            if visualized_batch is not None:
-                                for frame_tensor_to_write in visualized_batch: # NvidiaWriter takes single tensors
-                                    # Convert format for encoder if needed (e.g., float [0,1] -> uint8 [0,255])
-                                    # PyNvEncoder might need specific dtype. Let's assume it takes float for now or needs conversion.
-                                    # Example: frame_to_encode = (frame_tensor_to_write.clamp(0,1) * 255.0).byte()
-                                    self.writer_instance.put(frame_tensor_to_write) # Pass tensor directly
-                        
-                        # --- Stats, Cleanup, Progress ---
+                            # 5. GPU Visualization & Writing
+                            if _viz_enabled_this_run and self.writer_instance is not None: # Check writer is valid
+                                if self.perf: self.perf.start_timer('drawing_gpu')
+                                # Draw on the ARGB tensor
+                                visualized_batch_argb_float = add_gpu_overlays(
+                                    batch_argb_for_viz_and_model, batch_viz_data_for_gpu, self.zone_tracker.zones
+                                )
+                                if self.perf: self.perf.end_timer('drawing_gpu')
+
+                                if visualized_batch_argb_float is not None:
+                                    for frame_tensor_argb_float in visualized_batch_argb_float: # This is [4,H,W] ARGB float [0,1]
+                                        # Convert float [0,1] ARGB to uint8 [0,255] ARGB for NvidiaFrameWriter "ARBG" input
+                                        frame_to_encode_argb_uint8 = (frame_tensor_argb_float.clamp(0,1) * 255.0).byte()
+                                        # Ensure channel order didn't change if writer strictly needs A first
+                                        self.writer_instance.put(frame_to_encode_argb_uint8)
+
+                        else: # Preprocessing failed for the batch
+                            print(f"Warning: Preprocessing returned None or empty tensor for batch starting frame {frame_numbers_batch_abs[0]}. Skipping inference for this batch.")
+
+
+                        # --- Batch Post-Processing Steps ---
                         batch_time_taken = time.monotonic() - batch_start_mono
-                        frames_processed_count += len(frames_batch_gpu_tensors)
-                        if self.perf: self.perf.record_batch_processed(len(frames_batch_gpu_tensors), batch_time_taken); self.perf.sample_system_metrics()
-                        
+                        frames_processed_count += num_processed_in_batch
+                        if self.perf: self.perf.record_batch_processed(num_processed_in_batch, batch_time_taken); self.perf.sample_system_metrics()
+
+                        # --- Periodic Cleanup ---
                         current_mono_time = time.monotonic()
                         if current_mono_time - self.last_cleanup_time > MEMORY_CLEANUP_INTERVAL:
                              if self.perf: self.perf.start_timer('memory_cleanup')
                              last_frame_time_in_batch = frame_times_batch_abs[-1] if frame_times_batch_abs else 0
                              cleanup_tracking_data(self.tracker, self.zone_tracker, last_frame_time_in_batch)
-                             cleanup_memory()
+                             cleanup_memory() # General torch/cuda cleanup
                              self.last_cleanup_time = current_mono_time
                              if self.perf: self.perf.end_timer('memory_cleanup')
-                        
-                        # Progress Callback for Gradio
+
+                        # --- Progress Reporting ---
                         if progress_callback and self.perf:
                             p_stats = self.perf.get_progress()
                             base_prog = (current_chunk_idx_disp - 1) / total_chunks_disp
@@ -975,124 +1227,260 @@ class VideoProcessor:
                             status = f"Chunk {current_chunk_idx_disp}/{total_chunks_disp}: {p_stats['percent']:.1f}% (FPS:{p_stats['fps']:.1f}|ETA:{p_stats['eta']})"
                             try: progress_callback(overall, status)
                             except Exception as cb_err: print(f"Warning: Gradio progress_callback error: {cb_err}")
-
-                        # Console Progress
                         if self.perf and (current_mono_time - last_progress_print_time > 1.0):
                              prog_stats_console = self.perf.get_progress()
                              active_trk_count = self.tracker.get_active_vehicle_count() if hasattr(self.tracker, 'get_active_vehicle_count') else 'N/A'
                              print(f"\rChunk {current_chunk_idx_disp}/{total_chunks_disp} Prog:{prog_stats_console['percent']:.1f}%|FPS:{prog_stats_console['fps']:.1f}|Active:{active_trk_count}|ETA:{prog_stats_console['eta']} ", end="")
                              last_progress_print_time = current_mono_time
 
-                        # Clear Batch lists
+                        # --- Clear Batch Accumulators ---
                         frames_batch_gpu_tensors.clear(); frame_numbers_batch_abs.clear(); frame_times_batch_abs.clear()
-                        del input_batch_processed, yolo_results, batch_log_entries, batch_viz_data_for_gpu
-                        if _viz_enabled_this_run and self.writer_instance: del visualized_batch
-                        cleanup_memory()
+                        # Explicitly delete large tensors from this batch scope
+                        del batch_argb_for_viz_and_model, yolo_model_input, yolo_results, batch_log_entries, batch_viz_data_for_gpu
+                        if _viz_enabled_this_run and self.writer_instance is not None:
+                            if 'visualized_batch_argb_float' in locals() and visualized_batch_argb_float is not None:
+                                del visualized_batch_argb_float
+                            if 'frame_to_encode_argb_uint8' in locals():
+                                del frame_to_encode_argb_uint8
+                        cleanup_memory() # Call cleanup after deleting local batch vars
 
-                    self.frame_read_queue.task_done()
+                    # Mark the item from the reader queue as processed
+                    if self.frame_read_queue: self.frame_read_queue.task_done()
+
                 except queue.Empty:
-                    print("\n_process_single_video_file: Frame reader queue timed out. File might be shorter than expected or reader stuck."); break
-                except Exception as e:
-                    print(f"\n_process_single_video_file: ERROR during processing loop: {e}")
+                    # Check if the reader thread is still alive
+                    if self.reader_thread and not self.reader_thread.is_alive() and self.frame_read_queue.empty():
+                        print(f"\n_process_single_video_file: Reader thread finished and queue empty. Exiting loop.")
+                        break
+                    else:
+                        # Timeout occurred, but reader might still be working or just slow.
+                        # print(f"\n_process_single_video_file: Frame reader queue timeout. Reader alive: {self.reader_thread.is_alive() if self.reader_thread else 'N/A'}. Queue empty: {self.frame_read_queue.empty()}. Continuing wait.")
+                        continue # Continue waiting for more frames
+                except Exception as e_loop:
+                    print(f"\n_process_single_video_file: ERROR during processing loop: {e_loop}")
                     import traceback; traceback.print_exc()
                     if self.stop_event: self.stop_event.set(); # Signal other threads
-                    break
+                    break # Exit loop on error
             # --- End Main Processing Loop ---
 
-            # --- Process Final Batch ---
+            # --- Process Final Batch (if any frames remain) ---
             if frames_batch_gpu_tensors:
-                print("\n_process_single_video_file: Processing final batch...")
-                # ... (repeat batch processing logic for remaining frames) ...
-                # This needs to be a copy of the logic inside "if len(frames_batch_gpu_tensors) >= self.batch_size:"
-                # Ensure to add frames_processed_count += len(frames_batch_gpu_tensors)
+                processed_frame_indices_log.extend(frame_numbers_batch_abs)
+                print(f"\n_process_single_video_file: Processing final batch of {len(frames_batch_gpu_tensors)} frames...")
+                # --- THIS IS A COPY OF THE BATCH PROCESSING LOGIC ---
+                batch_start_mono = time.monotonic()
                 if self.perf: self.perf.start_timer('preprocessing')
-                input_batch_processed = self._preprocess_batch(frames_batch_gpu_tensors)
+                batch_argb_for_viz_and_model = self._preprocess_batch(frames_batch_gpu_tensors)
                 if self.perf: self.perf.end_timer('preprocessing')
-                if input_batch_processed and input_batch_processed.nelement() > 0:
-                    # ... (Inference, Post-processing, GPU Viz, Write, Stats) ...
-                    pass # Placeholder for full final batch logic
-                frames_processed_count += len(frames_batch_gpu_tensors)
-                del frames_batch_gpu_tensors # etc.
-                cleanup_memory()
 
-            # --- Finalize (Forced Exits, Thread Joins, Report) ---
+                batch_log_entries = []
+                batch_viz_data_for_gpu = []
+                num_processed_in_batch = len(frames_batch_gpu_tensors)
+
+                if batch_argb_for_viz_and_model is not None and batch_argb_for_viz_and_model.nelement() > 0:
+                    yolo_model_input = batch_argb_for_viz_and_model[:, 1:4, :, :] # RGB for model
+                    # --- Inference ---
+                    print(f"Debug VideoProcessor: Shape passed to model: {yolo_model_input.shape}, Dtype: {yolo_model_input.dtype}")
+                    yolo_results = self.model(yolo_model_input, verbose=False)
+                    # --- Post-processing ---
+                    batch_log_entries, batch_viz_data_for_gpu = self._process_inference_results(
+                        yolo_results, yolo_model_input, frame_numbers_batch_abs, frame_times_batch_abs, start_datetime_chunk
+                    )
+                    all_detections_structured_log.extend(batch_log_entries)
+                    # --- GPU Visualization & Writing ---
+                    if _viz_enabled_this_run and self.writer_instance is not None:
+                        if self.perf: self.perf.start_timer('drawing_gpu')
+                        visualized_batch_argb_float = add_gpu_overlays(
+                            batch_argb_for_viz_and_model, batch_viz_data_for_gpu, self.zone_tracker.zones
+                        )
+                        if self.perf: self.perf.end_timer('drawing_gpu')
+                        if visualized_batch_argb_float is not None:
+                            for frame_tensor_argb_float in visualized_batch_argb_float:
+                                frame_to_encode_argb_uint8 = (frame_tensor_argb_float.clamp(0,1) * 255.0).byte()
+                                self.writer_instance.put(frame_to_encode_argb_uint8)
+
+                frames_processed_count += num_processed_in_batch # Count before clearing
+
+                # <<< Print Summary of Processed Frames >>>
+                print("\n--- Processed Frame Index Summary ---")
+                if processed_frame_indices_log:
+                    processed_frame_indices_log.sort()
+                    count = len(processed_frame_indices_log)
+                    min_f = processed_frame_indices_log[0]
+                    max_f = processed_frame_indices_log[-1]
+                    print(f"Total frames processed: {count}")
+                    print(f"Min frame index: {min_f}")
+                    print(f"Max frame index: {max_f}")
+                    # Print first and last few for quick check
+                    print(f"First 10 indices: {processed_frame_indices_log[:10]}")
+                    print(f"Last 10 indices: {processed_frame_indices_log[-10:]}")
+                    # Check for gaps (simple check)
+                    gaps = [(processed_frame_indices_log[i] + 1) for i in range(count - 1) if processed_frame_indices_log[i+1] != processed_frame_indices_log[i] + 1]
+                    if gaps:
+                        print(f"Warning: Potential gaps found after frames: {gaps[:20]}...") # Print first 20 gaps
+                    else:
+                        print("No gaps found in processed frame indices (sequential).")
+                else:
+                    print("No frames were processed.")
+                print("--- End Processed Frame Index Summary ---")
+                
+                # Mark tasks done for the final batch items from read_queue
+                num_tasks_to_done_final = len(frames_batch_gpu_tensors)
+                if self.frame_read_queue:
+                    for _ in range(num_tasks_to_done_final):
+                        try: self.frame_read_queue.task_done()
+                        except ValueError: break 
+
+                # Clear final batch lists and delete tensors
+                frames_batch_gpu_tensors.clear(); frame_numbers_batch_abs.clear(); frame_times_batch_abs.clear()
+                del batch_argb_for_viz_and_model, yolo_model_input, yolo_results, batch_log_entries, batch_viz_data_for_gpu
+                if _viz_enabled_this_run and self.writer_instance is not None:
+                    if 'visualized_batch_argb_float' in locals() and visualized_batch_argb_float is not None:
+                        del visualized_batch_argb_float
+                    if 'frame_to_encode_argb_uint8' in locals():
+                        del frame_to_encode_argb_uint8
+                cleanup_memory()
+                print(f"Finished processing final batch. Total frames processed by inference: {frames_processed_count}")
+
+            # --- Finalize Stage (Forced Exits, Thread Joins, Reporting) ---
+            print(f"_process_single_video_file: Finalizing for {base_video_name}...")
             if self.tracker and hasattr(self.tracker, 'active_vehicles') and self.tracker.active_vehicles:
-                 print(f"Forcing exit for {len(self.tracker.active_vehicles)} remaining vehicles...")
-                 # Use last known timestamp from this chunk processing
+                 print(f"Forcing exit for {len(self.tracker.active_vehicles)} remaining active vehicles...")
                  last_ts_in_chunk = start_datetime_chunk + timedelta(seconds=frame_times_batch_abs[-1]) if frame_times_batch_abs else start_datetime_chunk
-                 # ... (Implement your forced exit logic from original process_video, append to all_detections_structured_log) ...
                  for v_id_force in list(self.tracker.active_vehicles.keys()):
                      if self.tracker.force_exit_vehicle(v_id_force, last_ts_in_chunk):
                          if self.perf: self.perf.record_vehicle_exit('forced_exit')
-                         # Find completed path entry for log
-                         p_data = next((p for p in reversed(self.tracker.completed_paths) if p['id']==v_id_force and p['status']=='forced_exit'), None)
+                         p_data = next((p for p in reversed(getattr(self.tracker, 'completed_paths', [])) if p['id']==v_id_force and p['status']=='forced_exit'), None)
                          if p_data:
-                              all_detections_structured_log.append({'timestamp_dt': last_ts_in_chunk, 'vehicle_id': v_id_force, 'vehicle_type': p_data.get('type'), 'event_type':'FORCED_EXIT', 'direction_from': p_data.get('entry_direction','?'), 'status':'forced_exit', 'time_in_intersection': p_data.get('time_in_intersection')})
+                              all_detections_structured_log.append({'timestamp_dt': last_ts_in_chunk, 'vehicle_id': v_id_force, 'vehicle_type': p_data.get('type', 'Unknown'), 'event_type':'FORCED_EXIT', 'direction_from': p_data.get('entry_direction','UNKNOWN'), 'direction_to': 'FORCED', 'status':'forced_exit', 'time_in_intersection': p_data.get('time_in_intersection', 'N/A'), 'frame_number': 'END'})
 
-
-            print(f"_process_single_video_file: Signaling threads to stop for {os.path.basename(video_path)}...");
+            # Signal threads to stop (reader might have already finished)
+            print(f"_process_single_video_file: Signaling stop_event for {base_video_name}...");
             if self.stop_event: self.stop_event.set()
-            if self.writer_instance: self.writer_instance.put(None) # EOS for writer
 
-            if self.reader_thread and self.reader_thread.is_alive(): self.reader_thread.join(timeout=10)
+            # Signal EOS to writer if it was initialized and running
+            if self.writer_instance is not None:
+                 print(f"Finalize: Sending EOS (None) to writer queue for {base_video_name}...");
+                 self.writer_instance.put(None) # EOS for writer
+
+            # Join reader thread
+            if self.reader_thread and self.reader_thread.is_alive():
+                print(f"Finalize: Joining reader thread for {base_video_name}...")
+                self.reader_thread.join(timeout=10)
+                if self.reader_thread.is_alive(): print(f"Warning: Reader thread join timed out for {base_video_name}.")
+                else: print(f"Reader thread joined for {base_video_name}.")
             
-            mux_success_this_file = True
-            if self.writer_instance:
+            # Stop and join writer thread (stop includes muxing)
+            mux_success_this_file = True # Assume success if no writer
+            if self.writer_instance is not None: # Check if writer object exists
+                 print(f"Finalize: Stopping writer (includes muxing) for {base_video_name}...")
                  mux_success_this_file = self.writer_instance.stop() # This blocks & runs muxing
-                 self.final_output_path_current_file = self.writer_instance.output_path if mux_success_this_file else None
+                 if mux_success_this_file and hasattr(self.writer_instance, 'output_path'):
+                     self.final_output_path_current_file = self.writer_instance.output_path
+                 else:
+                     self.final_output_path_current_file = None
+                     print(f"Warning: Muxing failed or writer stopped improperly for {base_video_name}.")
+            elif _viz_enabled_this_run:
+                 print(f"Finalize: Writer was not initialized, skipping writer stop/muxing for {base_video_name}.")
 
             # --- Performance Summary ---
             total_time_taken_file=0.0; fps_file=0.0; completed_paths_count_valid_file=0
-            if self.perf: self.perf.end_processing(); self.perf.print_summary(); total_time_taken_file=self.perf.total_time; fps_file=frames_processed_count/total_time_taken_file if total_time_taken_file>0 else 0
+            if self.perf:
+                self.perf.end_processing()
+                self.perf.print_summary()
+                total_time_taken_file=self.perf.total_time
+                fps_file=frames_processed_count/total_time_taken_file if total_time_taken_file>0 else 0
             
             final_completed_paths_for_report = []
-            if self.tracker:
-                 if hasattr(self.tracker, 'get_completed_paths'): final_completed_paths_for_report = self.tracker.get_completed_paths()
-                 elif hasattr(self.tracker, 'completed_paths'): final_completed_paths_for_report = self.tracker.completed_paths
-            
-            for path_rep in final_completed_paths_for_report: # Calculate valid for summary
-                if path_rep.get('status') == 'exited' and path_rep.get('entry_direction') and path_rep.get('exit_direction') and \
-                   path_rep.get('exit_direction') not in ['TIMEOUT', 'FORCED', 'UNKNOWN', None]:
+            if self.tracker and hasattr(self.tracker, 'get_completed_paths'):
+                 final_completed_paths_for_report = self.tracker.get_completed_paths()
+            elif self.tracker and hasattr(self.tracker, 'completed_paths'):
+                 final_completed_paths_for_report = self.tracker.completed_paths
+
+            # Calculate valid completed paths for summary
+            for path_rep in final_completed_paths_for_report:
+                status = path_rep.get('status')
+                exit_dir = path_rep.get('exit_direction')
+                if status == 'exited' and path_rep.get('entry_direction') and exit_dir and \
+                   exit_dir not in ['TIMEOUT', 'FORCED', 'UNKNOWN', None]:
                     completed_paths_count_valid_file +=1
-            
+
             # --- Create report for THIS CHUNK/FILE ---
-            print(f"Generating report for {os.path.basename(video_path)}...")
+            print(f"Generating report for {base_video_name}...")
             excel_file_path = create_excel_report(
                 completed_paths_data=final_completed_paths_for_report,
-                start_datetime=start_datetime_chunk, # Use the absolute start time of THIS chunk
+                start_datetime=start_datetime_chunk,
                 primary_direction=primary_direction,
-                video_path=video_path, # Original path or chunk path
+                video_path=video_path,
                 output_path_override=output_path_override
             )
 
-            result_msg_this_file = f"✅ Processing completed for {os.path.basename(video_path)}.\n"
+            # --- Prepare Result Message ---
+            result_msg_this_file = f"✅ Processing completed for {base_video_name}.\n"
             if _viz_enabled_this_run:
-                 if self.final_output_path_current_file and mux_success_this_file: result_msg_this_file += f"Output video segment: '{self.final_output_path_current_file}'.\n"
-                 elif not mux_success_this_file : result_msg_this_file += f"Output video segment generation failed (muxing error).\n"
-            if excel_file_path: result_msg_this_file += f"Report segment: {excel_file_path}\n"
-            else: result_msg_this_file += f"Report segment generation failed for {os.path.basename(video_path)}.\n"
-            result_msg_this_file += f"--- Summary Stats for {os.path.basename(video_path)} ---\nSTAT_FRAMES_PROCESSED={frames_processed_count}\nSTAT_TIME_SECONDS={total_time_taken_file:.2f}\nSTAT_FPS={fps_file:.2f}\nSTAT_COMPLETED_PATHS={completed_paths_count_valid_file}\n--- End Stats ---"
-            
+                 if self.final_output_path_current_file and mux_success_this_file:
+                     result_msg_this_file += f"Output video segment: '{self.final_output_path_current_file}'.\n"
+                 elif not mux_success_this_file:
+                     result_msg_this_file += f"Output video segment generation failed (muxing error).\n"
+                 else: # Writer wasn't initialized
+                      result_msg_this_file += f"Video output writing was disabled or failed during initialization.\n"
+            if excel_file_path:
+                result_msg_this_file += f"Report segment: {excel_file_path}\n"
+            else:
+                result_msg_this_file += f"Report segment generation failed for {base_video_name}.\n"
+            # Append Stats
+            result_msg_this_file += f"--- Summary Stats for {base_video_name} ---\n"
+            result_msg_this_file += f"STAT_FRAMES_PROCESSED={frames_processed_count}\n"
+            result_msg_this_file += f"STAT_TIME_SECONDS={total_time_taken_file:.2f}\n"
+            result_msg_this_file += f"STAT_FPS={fps_file:.2f}\n"
+            result_msg_this_file += f"STAT_COMPLETED_PATHS={completed_paths_count_valid_file}\n" # Using valid count
+            result_msg_this_file += f"--- End Stats ---"
+
+            print(f"_process_single_video_file: Finished successfully for {base_video_name}.")
             return result_msg_this_file
 
         except Exception as e_outer:
-            print(f"\nFATAL ERROR during _process_single_video_file for {os.path.basename(video_path)}: {e_outer}")
+            # Catch errors occurring anywhere in the process for this file
+            print(f"\nFATAL ERROR during _process_single_video_file for {base_video_name}: {e_outer}")
             import traceback; traceback.print_exc()
-            if hasattr(self, 'stop_event') and self.stop_event: self.stop_event.set()
+            # Ensure threads are signalled to stop on error
+            if hasattr(self, 'stop_event') and self.stop_event and not self.stop_event.is_set():
+                print("Signalling stop event due to outer exception...")
+                self.stop_event.set()
+            # Attempt to stop writer gracefully if it exists
             if hasattr(self, 'writer_instance') and self.writer_instance:
-                try: self.writer_instance.stop() # Attempt to stop writer and mux/cleanup
-                except: pass
-            return f"❌ Error processing {os.path.basename(video_path)}: {e_outer}"
+                try:
+                     print("Attempting to stop writer after outer exception...")
+                     self.writer_instance.stop(cleanup_raw_file=True) # Attempt cleanup
+                except Exception as e_stop:
+                     print(f"Exception while trying to stop writer during error handling: {e_stop}")
+            return f"❌ Error processing {base_video_name}: {e_outer}"
         finally:
             # --- Cleanup per-file resources ---
+            print(f"_process_single_video_file: Entering finally block for {base_video_name}...")
+            # Ensure reader thread is joined
             if hasattr(self, 'reader_thread') and self.reader_thread and self.reader_thread.is_alive():
-                self.reader_thread.join(timeout=1)
-            # NvidiaWriter.stop() should have been called and joined
-            self.tracker=None; self.zone_tracker=None; self.perf=None;
-            self.frame_read_queue=None; self.video_write_queue=None;
-            self.reader_thread=None; self.writer_instance=None; self.stop_event=None;
+                print(f"Finally: Joining reader thread for {base_video_name}...")
+                self.reader_thread.join(timeout=5)
+                if self.reader_thread.is_alive(): print(f"Warning: Reader thread join timed out in finally block for {base_video_name}.")
+            
+            # Writer thread should have been joined by writer_instance.stop() if called successfully
+            # If stop wasn't called (e.g., error before writer init), writer_thread might not exist or be relevant
+
+            # Clear instance variables to free resources and prevent state leakage
+            self.tracker=None
+            self.zone_tracker=None
+            self.perf=None
+            self.frame_read_queue=None
+            self.reader_thread=None
+            self.writer_instance=None # Ensure writer is cleared
+            self.reader_instance=None # Ensure reader is cleared
+            self.stop_event=None
+            self.reader_dimensions_ready_event = None
             self.final_output_path_current_file = None
-            cleanup_memory()
-            print(f"Finished cleanup for {os.path.basename(video_path)}")
+            self.detection_zones_polygons = None
+            
+            cleanup_memory() # Final cleanup attempt
+            print(f"Finished resource cleanup for {base_video_name}")
 
 # --- End of VideoProcessor class ---

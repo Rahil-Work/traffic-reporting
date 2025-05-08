@@ -5,7 +5,7 @@ import torch # Import torch to check GPU capability
 
 PROCESSING_MODE = 'enhanced'
 LINE_MODE = 'hardcoded'
-ENABLE_VISUALIZATION = True
+ENABLE_VISUALIZATION = False
 
 # --- Input Settings (primarily for hardcoded mode) ---
 INPUT_VIDEO_PATH = "C:/Users/EMAAN/Documents/YOLO/5 minute test - 4 Way Intersection.mp4"

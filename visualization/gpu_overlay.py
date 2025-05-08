@@ -55,14 +55,14 @@ def draw_boxes_on_batch(frame_batch_tensor, batch_detections):
 
             try:
                 # Call the imported function directly
-                draw_rectangle(output_batch[i:i+1], boxes_tensor.unsqueeze(0), color=colors_tensor.unsqueeze(0), fill=False, thickness=2)
+                draw_rectangle(output_batch[i:i+1], boxes_tensor.unsqueeze(0), color=colors_tensor.unsqueeze(0), fill=False)
                 # NOTE: Check Kornia docs for draw_rectangle signature in v0.8.
                 # It might expect image batch BxCxHxW and boxes BxNx4, colors BxNx3.
                 # The slicing above makes image B=1, boxes B=1, colors B=1 for the call.
             except TypeError as te:
-                 print(f"Kornia draw_rectangle TypeError (check arguments/shapes for v0.8.0): {te}")
+                print(f"Kornia draw_rectangle TypeError (check arguments/shapes for v0.8.0): {te}")
             except Exception as e:
-                 print(f"Kornia box drawing error: {e}")
+                print(f"Kornia box drawing error: {e}")
 
             # --- Text Drawing Placeholder ---
             # print(f"Frame {i}: IDs {ids_list}") # Still complex
