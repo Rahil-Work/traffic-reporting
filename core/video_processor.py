@@ -11,7 +11,7 @@ import shutil # For directory cleanup
 from datetime import datetime, timedelta
 import concurrent.futures
 import re
-import kornia.color as K
+import kornia.color
 
 # Configuration
 from config import (
@@ -357,101 +357,96 @@ class VideoProcessor:
                 except queue.Full: pass
 
 
-    # --- Core Processing Logic ---
     @torch.no_grad()
     def _preprocess_batch(self, current_batch_of_gpu_tensors_from_reader):
         """
         Prepares a batch for model inference and visualization.
-        Input: List of raw GPU tensors from NvidiaFrameReader (expected to represent NV12).
-        Output: ARGB batch tensor [B, 4, H_model, W_model], float, range [0,1]
+        Input: List of raw GPU tensors from NvidiaFrameReader (expected to represent NV12, uint8, shape (H*1.5, W)).
+        Output: ARGB batch tensor [B, 4, H_model, W_model], float32, range [0,1]
                 (where H_model, W_model are MODEL_INPUT_SIZE)
         """
+        # Define log prefix (can use self attributes if available, otherwise default)
+        log_prefix = getattr(self, 'thread_name_prefix', 'Preproc')
+
         if not current_batch_of_gpu_tensors_from_reader:
-            log_prefix = getattr(self, 'thread_name_prefix', 'Preproc')
-            print(f"{log_prefix}: Empty input tensor list.")
+            print(f"{log_prefix}: Received empty input tensor list for preprocessing.")
             return None
         
         processed_argb_tensors_for_batch = []
-        target_h_model, target_w_model = self.model_input_size_config, self.model_input_size_config
-        log_prefix = getattr(self, 'thread_name_prefix', 'Preproc') # For logging consistency
+        # Get target dimensions from config (assuming self.model_input_size_config is set)
+        target_h_model = getattr(self, 'model_input_size_config', 416) # Default if not set
+        target_w_model = getattr(self, 'model_input_size_config', 416)
 
-        # Ensure reader dimensions are available (should be set by now)
-        if not (hasattr(self.reader_instance, 'width') and self.reader_instance.width > 0 and \
+        # Get original video dimensions from the reader instance
+        # This needs self.reader_instance to be valid and have dimensions populated
+        if not (hasattr(self, 'reader_instance') and self.reader_instance is not None and \
+                hasattr(self.reader_instance, 'width') and self.reader_instance.width > 0 and \
                 hasattr(self.reader_instance, 'height') and self.reader_instance.height > 0):
-            print(f"{log_prefix}: Reader dimensions not yet available for NV12 conversion. Cannot process batch.")
-            return None
-        
+            print(f"{log_prefix}: CRITICAL - Reader instance or its dimensions not available for NV12 conversion. Cannot process batch.")
+            return None # Cannot proceed without knowing original dimensions
+            
         original_h = self.reader_instance.height
         original_w = self.reader_instance.width
 
-        # Check if dimensions are divisible by 2 (required by yuv420_to_rgb)
+        # Check if dimensions are divisible by 2 (required by kornia.color.yuv420_to_rgb)
         if original_h % 2 != 0 or original_w % 2 != 0:
             print(f"{log_prefix}: CRITICAL - Original video dimensions ({original_w}x{original_h}) "
-                  f"are not evenly divisible by 2. Kornia YUV420 conversion will likely fail. "
-                  f"Consider preprocessing videos to have even dimensions or adding padding/cropping.")
-            # Depending on requirements, you might try to crop here, but it's complex. Best to fix input videos.
-            # Returning None for now.
-            return None
+                  f"are not evenly divisible by 2. Kornia YUV420 conversion requires even dimensions. "
+                  f"Batch processing aborted.")
+            # Options: Crop input tensors here (complex), preprocess videos beforehand, or abort.
+            return None # Abort batch
 
         for idx, raw_nv12_tensor in enumerate(current_batch_of_gpu_tensors_from_reader):
-            if raw_nv12_tensor is None: continue
+            if raw_nv12_tensor is None:
+                print(f"{log_prefix}: Warning - Received None tensor at index {idx} in batch. Skipping.")
+                continue
             
+            # Ensure tensor is on the correct processing device (self.device)
             if str(raw_nv12_tensor.device) != str(self.device):
-                raw_nv12_tensor = raw_nv12_tensor.to(self.device)
+                try:
+                    raw_nv12_tensor = raw_nv12_tensor.to(self.device)
+                except Exception as e_move:
+                    print(f"{log_prefix}: Error moving tensor for frame index {idx} to device {self.device}: {e_move}. Skipping frame.")
+                    continue
 
             # --- NV12 to RGB Conversion using kornia.color.yuv420_to_rgb ---
-            # Debug print for the first frame's input tensor
-            if idx == 0: 
-                print(f"Debug Preproc (Frame 0): raw_nv12_tensor shape: {raw_nv12_tensor.shape}, dtype: {raw_nv12_tensor.dtype}")
+            # Debug print for the first frame's input tensor shape/dtype (optional)
+            # if idx == 0:
+            #     print(f"Debug Preproc (Batch Start): raw_nv12_tensor shape: {raw_nv12_tensor.shape}, dtype: {raw_nv12_tensor.dtype}")
 
-            # Step 1: Validate shape and dtype (expecting uint8, (H*1.5, W) from dlpack)
-            if raw_nv12_tensor.ndim != 2 or raw_nv12_tensor.shape != (int(original_h * 1.5), original_w):
+            # Step 1: Validate shape and dtype
+            expected_h_total = int(original_h * 1.5)
+            if raw_nv12_tensor.ndim != 2 or raw_nv12_tensor.shape != (expected_h_total, original_w):
                 print(f"{log_prefix}: Unexpected raw_nv12_tensor shape: {raw_nv12_tensor.shape} for frame index {idx}. "
-                      f"Expected (H*1.5, W) = ({int(original_h * 1.5)}, {original_w}). Skipping frame.")
+                      f"Expected 2D tensor shape ({expected_h_total}, {original_w}). Skipping frame.")
                 continue
                 
             if raw_nv12_tensor.dtype != torch.uint8:
-                print(f"{log_prefix}: Warning (frame index {idx}) - NV12 tensor dtype is {raw_nv12_tensor.dtype}, expected torch.uint8. Skipping frame (conversion may be needed earlier or check reader).")
-                # It's crucial that the input tensor is uint8 [0,255] before separating planes.
+                print(f"{log_prefix}: Warning (frame index {idx}) - NV12 tensor dtype is {raw_nv12_tensor.dtype}, expected torch.uint8. Skipping frame. Check reader output or DLPack conversion.")
                 continue
 
-            # Step 2: Separate Y and UV planes
+            # Step 2: Separate Y and UV planes from the single (H*1.5, W) tensor
             try:
-                # Y plane is the first H rows
                 y_plane = raw_nv12_tensor[:original_h, :] # Shape: [H, W]
-                # UV plane is the remaining H/2 rows, containing interleaved UV data
+
+                
+
                 uv_plane_interleaved = raw_nv12_tensor[original_h:, :] # Shape: [H/2, W]
 
-                # Step 3: De-interleave UV plane and reshape
-                # NV12 format: U V U V ...
+                # Step 3: De-interleave UV plane (NV12 format: U V U V...) and reshape
                 # Reshape to [H/2, W/2, 2] -> channel dimension stores U and V
                 uv_plane_deinterleaved = uv_plane_interleaved.reshape(original_h // 2, original_w // 2, 2)
                 
-                # Separate U and V. Kornia expects UV together as [B, 2, H/2, W/2]
-                # Permute to [2, H/2, W/2]
-                uv_plane_permuted = uv_plane_deinterleaved.permute(2, 0, 1) # Shape: [2, H/2, W/2]
+                # Permute to [2, H/2, W/2] for Kornia (Channel dimension first)
+                uv_plane_permuted = uv_plane_deinterleaved.permute(2, 0, 1)
 
-                # Step 4: Add Batch and Channel dimensions, convert Y to float [0,1], UV to float [-0.5, 0.5]
-                # Kornia's yuv420_to_rgb expects Y in [0,1] and UV in [-0.5, 0.5]
-                y_plane_final = y_plane.float().unsqueeze(0).unsqueeze(0) / 255.0 # Shape: [1, 1, H, W], Range [0,1]
                 
-                # Convert UV uint8 [0,255] to float [-0.5, 0.5] range expected by Kornia
-                # Formula: float = (uint8 / 255.0) - 0.5 (approximately, exact range might depend on standard)
-                # Or more precisely: Y range 16-235, UV range 16-240 -> map to float ranges.
-                # Let's use the simple scaling first, Kornia might handle standard ranges internally.
-                # uv_plane_final = (uv_plane_permuted.float() / 255.0) - 0.5 # Incorrect range mapping potentially
-                
-                # Kornia often works with YCbCr values directly. Let's try passing uint8 Y and uint8 UV
-                # and see if yuv420_to_rgb handles the conversion internally, OR convert to float and scale later.
-                # Trying with float inputs scaled simply:
-                # Y: [0, 1]
-                # UV: Convert uint8 [0, 255] to float [0, 1] first, Kornia might handle the range shift.
-                # Or check docs if it expects specific integer ranges.
-                # Safest bet might be to convert RGB->YUV420 in Kornia to see expected input ranges.
-                
-                # Let's assume yuv420_to_rgb takes Y [0,1] and UV [0,1] (from uint8/255) and handles offsets internally.
-                y_plane_input = y_plane.unsqueeze(0).unsqueeze(0).float() / 255.0 # [1, 1, H, W]
-                uv_plane_input = uv_plane_permuted.unsqueeze(0).float() / 255.0 # [1, 2, H/2, W/2]
+
+                # Step 4: Add Batch and Channel dimensions, convert to float [0,1] for Kornia input
+                y_plane_input = y_plane.float().unsqueeze(0).unsqueeze(0) / 255.0 # [1, 1, H, W], range [0,1]
+                uv_plane_permuted_float = uv_plane_permuted.float() # Convert to float first
+                uv_plane_scaled = (uv_plane_permuted_float / 255.0) - 0.5 # Approx Range [-0.5, 0.5]
+                uv_plane_input = uv_plane_scaled.unsqueeze(0)
 
             except Exception as e_reshape:
                 print(f"{log_prefix}: Error separating/reshaping YUV planes for frame index {idx}: {e_reshape}. Skipping frame.")
@@ -459,49 +454,91 @@ class VideoProcessor:
 
             # Step 5: Convert YUV420 to RGB using Kornia
             try:
-                frame_tensor_rgb_k = K.yuv420_to_rgb(y_plane_input, uv_plane_input) # Input: Y[B,1,H,W], UV[B,2,H/2,W/2] (float [0,1])
-                # Output: [B, 3, H, W], float32 [0,1]
-                if frame_tensor_rgb_k is None: raise RuntimeError("kornia.color.yuv420_to_rgb returned None")
-                frame_tensor_rgb = frame_tensor_rgb_k.squeeze(0) # Remove batch dim -> [3, H_original, W_original]
+                # Call Kornia function expecting Y[B,1,H,W], UV[B,2,H/2,W/2], both float [0,1]
+                frame_tensor_rgb_k = kornia.color.yuv420_to_rgb(y_plane_input, uv_plane_input) 
+                
+                if frame_tensor_rgb_k is None: 
+                    raise RuntimeError("kornia.color.yuv420_to_rgb returned None")
+
+                # Clamp the output to ensure [0,1] range
+                frame_tensor_rgb_k_clamped = torch.clamp(frame_tensor_rgb_k, 0.0, 1.0)
+                
+                # Remove the batch dimension for single frame processing
+                frame_tensor_rgb = frame_tensor_rgb_k_clamped.squeeze(0) # Shape: [3, H_original, W_original]
+
+                if idx==0:
+                    y_plane_np = y_plane.cpu().numpy()
+                    cv2.imwrite(f"debug_y_plane_frame_{idx}.png", y_plane_np) # Save first frame
+                    uv_plane_np = uv_plane_permuted.cpu().numpy()
+                    cv2.imwrite(f"debug_u_plane_frame_{idx}.png", uv_plane_np[0]) # Save U
+                    cv2.imwrite(f"debug_v_plane_frame_{idx}.png", uv_plane_np[1]) # Save V
+                    temp_rgb_k = frame_tensor_rgb_k.squeeze(0).permute(1, 2, 0) # CHW -> HWC
+                    temp_rgb_k_np = temp_rgb_k.cpu().numpy()
+                    print(f"{log_prefix}: Kornia Raw Output (Frame {idx}): Min={temp_rgb_k_np.min():.4f}, Max={temp_rgb_k_np.max():.4f}, Mean={temp_rgb_k_np.mean():.4f}")
+                    
+                    # Scale to [0, 255] uint8 for saving, handle potential range issues
+                    # Simple clamp and scale [0,1] -> [0,255]
+                    scaled_rgb_np_vis = np.clip(temp_rgb_k_np * 255.0, 0, 255).astype(np.uint8)
+                    
+                    # Kornia outputs RGB, OpenCV uses BGR
+                    bgr_output_kornia = cv2.cvtColor(scaled_rgb_np_vis, cv2.COLOR_RGB2BGR)
+                    cv2.imwrite(f"debug_frame_{idx}_3_kornia_rgb_output.png", bgr_output_kornia)
+                    print(f"{log_prefix}: Saved Kornia raw RGB output for frame index {idx}.")
 
             except Exception as e_conv:
-                print(f"{log_prefix}: Error during yuv420_to_rgb conversion for frame index {idx}: {e_conv}. Skipping frame.")
-                import traceback; traceback.print_exc() # Print stack trace for Kornia errors
+                print(f"{log_prefix}: Error during kornia.color.yuv420_to_rgb conversion for frame index {idx}: {e_conv}. Skipping frame.")
+                # Optionally print full traceback for debugging Kornia issues
+                # import traceback; traceback.print_exc()
                 continue
 
             # frame_tensor_rgb is now [3, H_original, W_original], float32, range [0,1]
 
-            # Step 6: Add Alpha channel to make it ARGB (Alpha first)
-            _c, current_h, current_w = frame_tensor_rgb.shape
+            # Step 6: Add Alpha channel to make it ARGB (Alpha first) for visualization/writer
+            _c, current_h, current_w = frame_tensor_rgb.shape # Should be 3 channels
+            # Create alpha channel (all ones for full opacity) matching dtype and device
             alpha_channel = torch.ones((1, current_h, current_w), dtype=frame_tensor_rgb.dtype, device=frame_tensor_rgb.device)
-            # Create ARGB: Alpha, R, G, B
-            frame_tensor_argb = torch.cat((alpha_channel, frame_tensor_rgb), dim=0) # [4, H_original, W_original]
+            # Concatenate: Alpha, R, G, B
+            frame_tensor_argb = torch.cat((alpha_channel, frame_tensor_rgb), dim=0) # Shape: [4, H_original, W_original]
 
-            # Step 7: Resize to model input size
+            # Step 7: Resize the ARGB tensor to the target model input size
             if current_h != target_h_model or current_w != target_w_model:
                 try:
                     frame_tensor_argb_resized = F.interpolate(
-                        frame_tensor_argb.unsqueeze(0), size=(target_h_model, target_w_model),
-                        mode='bilinear', align_corners=False
-                    ).squeeze(0) # [4, H_model, W_model]
+                        frame_tensor_argb.unsqueeze(0), # Add batch dim for interpolate
+                        size=(target_h_model, target_w_model),
+                        mode='bilinear',
+                        align_corners=False # Generally recommended for image resizing
+                    ).squeeze(0) # Remove batch dim -> Shape: [4, H_model, W_model]
+                    
+                    # Debug print for resized shape (optional)
+                    # if idx == 0:
+                    #     print(f"Debug Preproc (Frame 0): Resized ARGB tensor shape: {frame_tensor_argb_resized.shape}")
+
                 except Exception as e_resize:
                     print(f"{log_prefix}: Error during resize for frame index {idx}: {e_resize}. Skipping frame.")
                     continue
             else:
+                # No resize needed if already target size
                 frame_tensor_argb_resized = frame_tensor_argb
             
             processed_argb_tensors_for_batch.append(frame_tensor_argb_resized)
 
-        # --- Batch Post-processing ---
+        # --- End of loop through batch tensors ---
+
         if not processed_argb_tensors_for_batch:
-            print(f"{log_prefix}: No tensors were successfully processed in this batch.")
+            print(f"{log_prefix}: No tensors were successfully processed in this batch after conversion/resize.")
             return None
             
-        # Stack processed tensors into a batch
+        # Stack individual processed tensors into the final batch tensor
         # Output is ARGB, float32, [0,1], resized to model_input_size
-        final_batch_tensor_argb = torch.stack(processed_argb_tensors_for_batch)
-        
+        try:
+            final_batch_tensor_argb = torch.stack(processed_argb_tensors_for_batch)
+        except Exception as e_stack:
+            print(f"{log_prefix}: Error stacking processed tensors into batch: {e_stack}")
+            return None
+
         return final_batch_tensor_argb
+    
 
     def _process_inference_results(self, results_yolo, input_batch_tensor_for_viz, frame_numbers, frame_times, start_datetime_chunk):
         """
@@ -1160,8 +1197,6 @@ class VideoProcessor:
                                 except Exception as e_stat:
                                     print(f"\nError getting tensor stats: {e_stat}")
                             
-                            input()
-
 
                             # 3. Inference
                             stream = None
