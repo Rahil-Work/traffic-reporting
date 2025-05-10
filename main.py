@@ -1,6 +1,7 @@
 # project/main.py
 import os
 import sys
+import threading
 
 from config import (
     LINE_MODE, PROCESSING_MODE, GRADIO_SERVER_PORT, GRADIO_SHARE,
@@ -63,6 +64,7 @@ def run_app():
             
             print("\n--- Processing Started ---")
             final_result_message = "Processing did not complete."
+            processing_completed_successfully = False
 
             for status_update in processor.process_video(
                 video_path=INPUT_VIDEO_PATH,
@@ -70,27 +72,65 @@ def run_app():
                 start_time_str=START_TIME,
                 primary_direction=DEFAULT_PRIMARY_DIRECTION.lower() # Pass lowercase
             ):
-                if isinstance(status_update, str):
-                    # Print intermediate status updates from the processor
-                    print(f"STATUS: {status_update}")
-                elif isinstance(status_update, dict) and 'final_message' in status_update:
-                    # Store the final message when received
+                if isinstance(status_update, dict) and 'final_message' in status_update:
                     final_result_message = status_update['final_message']
-                    # No break needed here, let generator finish naturally
-                else:
-                    print(f"Received unexpected status: {status_update}")
-            print("\n--- Processing Result ---")
-            print(final_result_message) # Print the final comprehensive message
+                    print("\n--- Processing Result (from main.py) ---", flush=True)
+                    print(final_result_message, flush=True)
+                    print("-------------------------", flush=True)
+                    if "✅" in final_result_message: # Simple check for success
+                        processing_completed_successfully = True
+                elif isinstance(status_update, str):
+                    print(f"STATUS (from main.py): {status_update}", flush=True)
+            print("Main: processor.process_video() generator exhausted.", flush=True)
+            # print("\n--- Processing Result ---")
+            # print(final_result_message) # Print the final comprehensive message
             print("-------------------------")
         except Exception as e:
             print(f"\n--- ERROR during hardcoded processing ---", file=sys.stderr)
             print(f"Error: {e}", file=sys.stderr)
             import traceback; traceback.print_exc()
             print("-----------------------------------------", file=sys.stderr)
-            sys.exit(1)
+            final_result_message = f"Error during processing: {e}"
+            # sys.exit(1)
+        finally:
+            print("Main: Entering main's finally block.", flush=True)
+            # Lock release in VideoProcessor's finally should handle it.
+            # Releasing here again might cause issues if already released.
+            # if processor and hasattr(processor, 'processing_lock') and processor.processing_lock.locked():
+            #     try:
+            #         processor.processing_lock.release()
+            #         print("Main: Processing lock released in main's finally block (if held).", flush=True)
+            #     except RuntimeError: 
+            #         print("Main: Attempted to release lock in main's finally, but was not held.", flush=True)
+            #         pass 
+            
+            print(f"Main: Video processing loop finished. Success: {processing_completed_successfully}", flush=True)
+            print(f"Main: Final result message before exit: {final_result_message}", flush=True)
     else:
         print(f"Error: Invalid LINE_MODE '{LINE_MODE}'. Choose 'interactive' or 'hardcoded'.", file=sys.stderr)
-        sys.exit(1)
+        return
+        # sys.exit(1)
+    print("Main: run_app() is about to finish.", flush=True)
 
 if __name__ == "__main__":
-    run_app()
+    print("Main: Script execution started.", flush=True)
+    try:
+        run_app()
+    except Exception as e_main:
+        print(f"FATAL ERROR in main execution: {e_main}", flush=True)
+        import traceback
+        traceback.print_exc()
+    finally:
+        print("Main: Script __main__ finally block reached.", flush=True)
+        
+        # ---- DEBUG ACTIVE THREADS ----
+        print("Main: Listing active threads before sys.exit()...", flush=True)
+        active_threads = threading.enumerate()
+        if not active_threads or len(active_threads) <= 1 : # MainThread is usually 1
+             print("  No unexpected active threads found (or only MainThread).", flush=True)
+        for i, th in enumerate(active_threads):
+            print(f"  Thread {i+1}: Name='{th.name}', Daemon={th.isDaemon()}, Alive={th.is_alive()}", flush=True)
+        # ---- END DEBUG ----
+        
+        print("Main: Attempting sys.exit(0)...", flush=True)
+        sys.exit(0) 

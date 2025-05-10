@@ -58,7 +58,9 @@ if MODEL_INPUT_SIZE >= 640: _default_batch = 16 if PROCESSING_MODE == 'standard'
 else: _default_batch = 32 if PROCESSING_MODE == 'standard' else 128 # Keep larger for 320
 OPTIMAL_BATCH_SIZE = _default_batch
 
-_cpu_count = os.cpu_count(); THREAD_COUNT = min(64, _cpu_count * 2) if _cpu_count else 24
+_cpu_count = os.cpu_count()
+THREAD_COUNT = 1
+# THREAD_COUNT = min(64, _cpu_count * 2) if _cpu_count else 24
 MIXED_PRECISION = True if PROCESSING_MODE == 'enhanced' and torch.cuda.is_available() else False
 PARALLEL_STREAMS = 16 if PROCESSING_MODE == 'enhanced' else 2
 

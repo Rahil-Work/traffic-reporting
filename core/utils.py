@@ -105,10 +105,22 @@ def setup_thread_affinity(perf_cores=8, eff_cores=4):
 
 def cleanup_memory():
     """Explicitly run garbage collection and clear CUDA cache."""
+    print("DEBUG_UTIL: cleanup_memory - Before gc.collect()", flush=True)
     gc.collect()
+    print("DEBUG_UTIL: cleanup_memory - After gc.collect()", flush=True)
     if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    debug_print("Performed memory cleanup (GC + CUDA Cache)")
+        print("DEBUG_UTIL: cleanup_memory - Before torch.cuda.synchronize()", flush=True)
+        torch.cuda.synchronize() # ADD THIS LINE
+        print("DEBUG_UTIL: cleanup_memory - After torch.cuda.synchronize(), Before torch.cuda.empty_cache()", flush=True)
+        torch.cuda.empty_cache() 
+        print("DEBUG_UTIL: cleanup_memory - After torch.cuda.empty_cache()", flush=True)
+    
+    # Use your existing debug_print or a direct print for this message
+    if DEBUG_MODE:
+        # If debug_print doesn't handle flush, use direct print for debugging this part
+        print("DEBUG_UTIL: Performed memory cleanup (GC + CUDA Cache)", flush=True)
+    else:
+        print("Performed memory cleanup (GC + CUDA Cache)", flush=True)
 
 def get_video_properties(video_path):
     """Gets duration (seconds), fps, and frame count using OpenCV."""
