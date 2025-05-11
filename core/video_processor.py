@@ -7,9 +7,9 @@ import os
 import threading
 import queue
 import gc
+import math
 from datetime import datetime, timedelta
 import concurrent.futures
-from concurrent.futures import ThreadPoolExecutor
 
 # Configuration
 from config import (
@@ -17,7 +17,8 @@ from config import (
     VIDEO_OUTPUT_DIR, ENABLE_DETAILED_PERFORMANCE_METRICS,
     MIXED_PRECISION, PARALLEL_STREAMS, DEBUG_MODE, THREAD_COUNT,
     MEMORY_CLEANUP_INTERVAL, MODEL_PATH, CONF_THRESHOLD, IOU_THRESHOLD,
-    LINE_MODE, LINE_POINTS, MODEL_INPUT_SIZE, ENABLE_VISUALIZATION # Import the flag
+    LINE_MODE, LINE_POINTS, MODEL_INPUT_SIZE, ENABLE_VISUALIZATION,
+    USE_ADVANCED_VIDEO_READER, PYVIDEOREADER_DECODE_SEGMENT_SIZE
 )
 
 # Modules
@@ -34,11 +35,22 @@ from reporting.excel_report import create_excel_report
 if ENABLE_DETAILED_PERFORMANCE_METRICS:
     from visualization.performance_viz import visualize_performance
 
+# Attempt to import PyVideoReader
+PYVIDEOREADER_AVAILABLE = False
+PyVideoReader = None 
+try:
+    from video_reader import PyVideoReader
+    PYVIDEOREADER_AVAILABLE = True
+    print("PyVideoReader (video_reader-rs) found and available.")
+except ImportError:
+    print("PyVideoReader (video_reader-rs) not found. Advanced video reader will not be used.")
+
 
 class VideoProcessor:
     def __init__(self):
         self.target_fps = TARGET_FPS
         self.frame_shape = (FRAME_WIDTH, FRAME_HEIGHT)
+        self.model_input_size_config = MODEL_INPUT_SIZE # Square size for model
         self.batch_size = OPTIMAL_BATCH_SIZE
         self.processing_lock = threading.Lock()
         self.line_mode = LINE_MODE # Controls zone definition method
@@ -76,8 +88,18 @@ class VideoProcessor:
             self.streams = [torch.cuda.Stream() for _ in range(PARALLEL_STREAMS)]
         self.current_stream_index = 0
 
-    # --- Gradio Polygon Related Methods ---
+        # Determine if advanced reader will be used based on config and availability
+        self.pvr_decode_segment_size = PYVIDEOREADER_DECODE_SEGMENT_SIZE
+        self.actually_use_advanced_reader = USE_ADVANCED_VIDEO_READER and PYVIDEOREADER_AVAILABLE
+        if self.actually_use_advanced_reader:
+            print("Configuration: Advanced video reader (PyVideoReader) will be used.")
+        else:
+            if USE_ADVANCED_VIDEO_READER and not PYVIDEOREADER_AVAILABLE:
+                print("Configuration: Advanced video reader was requested but is not available. Using OpenCV.")
+            else: # USE_ADVANCED_VIDEO_READER is False
+                print("Configuration: Using OpenCV video reader.")
 
+    # --- Gradio Polygon Related Methods ---
     def _draw_polygons_for_gradio(self, frame_to_draw_on):
         if frame_to_draw_on is None: return None
         img_copy = frame_to_draw_on.copy()
@@ -180,37 +202,179 @@ class VideoProcessor:
         return frame_to_show, status
 
     # --- Video Reading/Writing Threads ---
+    def _get_video_properties(self, video_path):
+        """Gets total frames and original FPS, trying PyVideoReader first if enabled."""
+        total_frames = 0
+        original_fps = 0.0
+
+        if self.actually_use_advanced_reader:
+            temp_reader_rs = None
+            try:
+                # For getting properties, no need for device='cuda' or specific resize
+                temp_reader_rs = PyVideoReader(video_path)
+                info = temp_reader_rs.get_info()
+                total_frames = int(info.get('frame_count', 0))
+                fps_str = info.get('fps', '0.0')
+                if fps_str:
+                    try: original_fps = float(fps_str)
+                    except ValueError: pass
+                del temp_reader_rs 
+            except Exception as e:
+                debug_print(f"PyVideoReader property fetch failed: {e}. Falling back to OpenCV for props.")
+                if temp_reader_rs: del temp_reader_rs
+        
+        if total_frames <= 0 or original_fps <= 0: # If PyVideoReader failed or wasn't used
+            cap_check = None
+            try:
+                cap_check = cv2.VideoCapture(video_path)
+                if not cap_check.isOpened():
+                    raise FileNotFoundError(f"OpenCV: Cannot open video for properties: {video_path}")
+                
+                _total_frames_cv = int(cap_check.get(cv2.CAP_PROP_FRAME_COUNT))
+                _original_fps_cv = cap_check.get(cv2.CAP_PROP_FPS)
+                
+                if total_frames <= 0: total_frames = _total_frames_cv
+                if original_fps <= 0: original_fps = _original_fps_cv
+            except Exception as e:
+                print(f"Error getting video properties with OpenCV: {e}")
+            finally:
+                if cap_check: cap_check.release()
+
+        if original_fps <= 0: original_fps = 30.0 # Final fallback
+        if total_frames <= 0:
+            print("WARNING: Could not determine total_frames accurately. Progress calculation might be affected.")   
+        return total_frames, original_fps
+
     def _frame_reader_task(self, video_path, original_fps):
         cap = None
         try:
             cap = cv2.VideoCapture(video_path)
             if not cap.isOpened(): print("ERROR: Reader failed to open video."); self.frame_read_queue.put(None); return
-            frame_interval = max(1, round(original_fps / self.target_fps)); frame_count = 0; frames_yielded = 0
+            frame_interval = max(1, round(original_fps / self.target_fps))
+            frame_count_raw = 0
+            frames_yielded = 0
             while not self.stop_event.is_set():
-                ret, frame = cap.read();
-                if not ret: break
-                if frame_count % frame_interval == 0:
-                    frame_time_seconds = frame_count / original_fps
+                ret, frame_bgr_orig_size = cap.read() # frame is BGR HWC NumPy array
+                if not ret: 
+                    debug_print("OpenCV Reader: End of video or read error.")
+                    break # End of video or error
+                if frame_count_raw  % frame_interval == 0:
+                    frame_time_seconds = frame_count_raw  / original_fps
+                    # Metadata for OpenCV frames: not RGB, source is opencv
+                    metadata = {'is_rgb': False, 'source': 'opencv'}
                     try:
                         # Add frame to queue for processing
-                        self.frame_read_queue.put((frame, frame_count, frame_time_seconds), block=True, timeout=5.0)
+                        self.frame_read_queue.put((frame_bgr_orig_size, frame_count_raw , frame_time_seconds, metadata), block=True, timeout=5.0)
                         frames_yielded += 1
                     except queue.Full:
                         debug_print("Reader queue full, waiting...")
-                        time.sleep(0.1);
+                        time.sleep(0.1)
                         if self.stop_event.is_set(): break
                         try: # Retry put
-                            self.frame_read_queue.put((frame, frame_count, frame_time_seconds), block=True, timeout=5.0)
+                            self.frame_read_queue.put((frame_bgr_orig_size, frame_count_raw , frame_time_seconds, metadata), block=True, timeout=5.0)
                             frames_yielded += 1
-                        except queue.Full: print("ERROR: Reader queue persistently full."); break
-                    except Exception as e: debug_print(f"Reader queue error: {e}"); break
-                frame_count += 1
-            debug_print(f"Reader finished. Read {frame_count}, yielded ~{frames_yielded}.")
-        except Exception as e: print(f"ERROR in reader thread: {e}")
+                        except queue.Full: print("ERROR: Reader queue persistently full."); self.stop_event.set(); break
+                    except Exception as q_e: 
+                        debug_print(f"OpenCV Reader: Queue put error: {q_e}")
+                        self.stop_event.set() # Signal main loop
+                        break
+                frame_count_raw  += 1
+            debug_print(f"OpenCV Reader finished. Raw frames read: {frame_count_raw}. Frames yielded to queue: {frames_yielded}.")
+        except Exception as e: 
+            print(f"FATAL ERROR in _frame_reader_task (OpenCV): {e}")
+            import traceback
+            traceback.print_exc()
         finally:
             if cap: cap.release()
             if self.frame_read_queue:
-                try: self.frame_read_queue.put(None, timeout=1.0) # Signal end to reader queue
+                try:
+                    # Ensure None is put to signal end, even if loop broke due to error or stop_event
+                    self.frame_read_queue.put(None, block=False, timeout=1.0) 
+                except queue.Full:
+                    debug_print("OpenCV Reader: Queue full on final None put.")
+                except Exception as e_fin:
+                    debug_print(f"OpenCV Reader: Error on final None put: {e_fin}")
+
+    def _frame_reader_task_pvr_segmented(self, video_path, original_fps_from_props, total_frames_from_props):
+        """Frame reader using PyVideoReader, decoding in segments, then selecting frames."""
+        pvr_instance = None
+        try:
+            target_dim_model = self.model_input_size_config
+            debug_print(f"PVR SegReader: Init PyVideoReader: device='cuda', target_size=({target_dim_model}x{target_dim_model})")
+            
+            pvr_instance = PyVideoReader(video_path, device='cuda', 
+                                         resize_shorter_side=target_dim_model,
+                                         resize_longer_side=target_dim_model)
+            
+            frame_interval = max(1, round(original_fps_from_props / self.target_fps))
+            queued_frame_count = 0
+            
+            num_segments = math.ceil(total_frames_from_props / self.pvr_decode_segment_size) if total_frames_from_props > 0 else 1
+            if total_frames_from_props == 0 : num_segments = 0 # No frames to read
+
+            debug_print(f"PVR SegReader: Video Length={total_frames_from_props} frames, "
+                        f"Segment Size={self.pvr_decode_segment_size}, Num Segments={num_segments}")
+
+            for i in range(num_segments):
+                if self.stop_event.is_set(): break
+
+                segment_start_raw_idx = i * self.pvr_decode_segment_size
+                # For PyVideoReader.decode, end_frame is exclusive
+                segment_end_raw_idx = min((i + 1) * self.pvr_decode_segment_size, total_frames_from_props)
+
+                if segment_start_raw_idx >= segment_end_raw_idx : continue # Segment is empty or invalid
+
+                debug_print(f"PVR SegReader: Decoding segment {i+1}/{num_segments} "
+                            f"(raw frames {segment_start_raw_idx} to {segment_end_raw_idx-1})...")
+                
+                # Frames are RGB, (model_input_size, model_input_size, 3)
+                segment_frames_np = pvr_instance.decode(start_frame=segment_start_raw_idx, 
+                                                        end_frame=segment_end_raw_idx)
+
+                if segment_frames_np is None or segment_frames_np.shape[0] == 0:
+                    debug_print(f"PVR SegReader: Segment {i+1} returned no frames. Video might have ended or error.")
+                    continue # Try next segment if any, or loop will end.
+
+                # Select frames from this decoded segment based on frame_interval
+                for frame_in_segment_idx in range(segment_frames_np.shape[0]):
+                    if self.stop_event.is_set(): break
+
+                    # This is the original, absolute frame index in the video
+                    current_overall_raw_frame_idx = segment_start_raw_idx + frame_in_segment_idx
+                    
+                    if current_overall_raw_frame_idx % frame_interval == 0:
+                        frame_content = segment_frames_np[frame_in_segment_idx]
+                        current_frame_time_sec = current_overall_raw_frame_idx / original_fps_from_props
+                        metadata = {'is_rgb': True, 'source': 'pvr_cuda_segmented'}
+                        
+                        try:
+                            self.frame_read_queue.put((frame_content, current_overall_raw_frame_idx, current_frame_time_sec, metadata),
+                                                      block=True, timeout=5.0)
+                            queued_frame_count += 1
+                        except queue.Full:
+                            debug_print("PVR SegReader: Queue full, retrying...")
+                            time.sleep(0.1);
+                            if self.stop_event.is_set(): break
+                            try:
+                                self.frame_read_queue.put((frame_content, current_overall_raw_frame_idx, current_frame_time_sec, metadata),
+                                                           block=True, timeout=5.0)
+                                queued_frame_count += 1
+                            except queue.Full: print("ERROR: PVR SegReader queue persistently full."); self.stop_event.set(); break # Stop reader
+                        except Exception as q_e: debug_print(f"PVR SegReader queue put error: {q_e}"); self.stop_event.set(); break
+                
+                # Release segment memory if possible (NumPy array will be dereferenced when loop iterates)
+                del segment_frames_np 
+                gc.collect() # Suggest garbage collection
+
+            debug_print(f"PVR SegReader finished. Queued {queued_frame_count} frames.")
+
+        except Exception as e:
+            print(f"FATAL ERROR in _frame_reader_task_pvr_segmented: {e}")
+            import traceback; traceback.print_exc()
+        finally:
+            if pvr_instance: del pvr_instance # PyVideoReader typically doesn't have explicit close
+            if self.frame_read_queue:
+                try: self.frame_read_queue.put(None, block=False, timeout=1.0)
                 except queue.Full: pass
 
     def _frame_writer_task(self, output_path):
@@ -278,17 +442,121 @@ class VideoProcessor:
 
     # --- Core Processing Logic ---
     @torch.no_grad()
-    def _preprocess_batch(self, frame_list):
-        tensors = []; target_size = self.model_input_size_config
-        for frame in frame_list:
-            if frame is None or not isinstance(frame, np.ndarray): continue
-            img=cv2.resize(frame,(target_size,target_size)); img=cv2.cvtColor(img,cv2.COLOR_BGR2RGB)
-            img=img.transpose(2,0,1); img=np.ascontiguousarray(img); tensors.append(img)
-        if not tensors: return None
-        batch_tensor=torch.from_numpy(np.stack(tensors)).to(self.device)
-        dtype=torch.float16 if (MIXED_PRECISION and self.device=='cuda') else torch.float32
-        batch_tensor = batch_tensor.to(dtype)/255.0;
-        return batch_tensor
+    def _preprocess_batch(self, frames_batch_with_metadata): # Expects list of (frame_np, metadata_dict)
+        preprocessed_tensors_list = []
+        target_dim_for_model = self.model_input_size_config
+
+        for frame_np_content, metadata in frames_batch_with_metadata:
+            if frame_np_content is None or not isinstance(frame_np_content, np.ndarray):
+                debug_print("Skipping None or invalid frame_np_content in _preprocess_batch.")
+                continue
+
+            is_rgb_input = metadata.get('is_rgb', False) # Default to False if metadata is malformed
+            source_reader = metadata.get('source', 'unknown')
+            
+            # Current state of frame_np_content:
+            # If source is 'pvr_cuda_segmented':
+            #   - It's RGB (is_rgb_input should be True)
+            #   - It's already resized to (target_dim_for_model, target_dim_for_model)
+            # If source is 'opencv':
+            #   - It's BGR (is_rgb_input should be False)
+            #   - It's the original frame size from cap.read()
+
+            img_rgb_model_sized = None
+
+            if source_reader.startswith('pvr_cuda'): # Catches 'pvr_cuda_segmented' or future PVR sources
+                if not is_rgb_input:
+                    # This would be unexpected from PVR, but handle it.
+                    debug_print(f"Preprocess (PVR path): Warning! Expected RGB, got BGR? metadata: {metadata}. Converting.")
+                    frame_np_content = cv2.cvtColor(frame_np_content, cv2.COLOR_BGR2RGB)
+
+                if frame_np_content.shape[0] != target_dim_for_model or \
+                   frame_np_content.shape[1] != target_dim_for_model:
+                    # This is a sanity check; PyVideoReader should have resized it.
+                    debug_print(f"Preprocess (PVR path): Warning! Frame shape {frame_np_content.shape[:2]} "
+                                f"not at target model size ({target_dim_for_model},{target_dim_for_model}). Resizing again.")
+                    img_rgb_model_sized = cv2.resize(frame_np_content, 
+                                                     (target_dim_for_model, target_dim_for_model), 
+                                                     interpolation=cv2.INTER_LINEAR)
+                else:
+                    img_rgb_model_sized = frame_np_content # Already RGB and correct size
+            
+            elif source_reader == 'opencv':
+                if is_rgb_input: # Unexpected from OpenCV, but handle
+                    debug_print(f"Preprocess (OpenCV path): Warning! Expected BGR, got RGB? metadata: {metadata}. Assuming it's RGB to be safe for cvtColor.")
+                    # If it was truly RGB, cvtColor to BGR then back to RGB is wasteful but safe.
+                    # Or, assume it's actually BGR and the metadata was wrong.
+                    # For now, let's trust the metadata if it says RGB, and if not, assume BGR.
+                    # This path assumes frame_np_content is BGR as per OpenCV default
+                    pass # It will be handled by cvtColor(COLOR_BGR2RGB) below
+
+                # OpenCV frames are BGR and original size. Resize then convert.
+                resized_bgr = cv2.resize(frame_np_content, 
+                                         (target_dim_for_model, target_dim_for_model), 
+                                         interpolation=cv2.INTER_LINEAR)
+                img_rgb_model_sized = cv2.cvtColor(resized_bgr, cv2.COLOR_BGR2RGB)
+            
+            else: # Fallback for unknown source
+                debug_print(f"Preprocess: Unknown frame source '{source_reader}'. Attempting general processing.")
+                temp_frame = frame_np_content.copy()
+                if not is_rgb_input: # If not RGB, assume BGR and convert
+                    temp_frame = cv2.cvtColor(temp_frame, cv2.COLOR_BGR2RGB)
+                
+                # Resize if necessary
+                if temp_frame.shape[0] != target_dim_for_model or \
+                   temp_frame.shape[1] != target_dim_for_model:
+                    img_rgb_model_sized = cv2.resize(temp_frame, 
+                                                     (target_dim_for_model, target_dim_for_model), 
+                                                     interpolation=cv2.INTER_LINEAR)
+                else:
+                    img_rgb_model_sized = temp_frame
+            
+            if img_rgb_model_sized is None: 
+                debug_print(f"Preprocess: img_rgb_model_sized is None for a frame. Source: {source_reader}. Skipping.")
+                continue
+            
+            # Common processing: HWC uint8 RGB -> CHW float32 [0,1] RGB for PyTorch
+            # Ensure it's 3 channels (e.g. not grayscale by mistake)
+            if img_rgb_model_sized.ndim == 2: # Grayscale
+                debug_print("Preprocess: Grayscale frame detected, converting to RGB for model.")
+                img_rgb_model_sized = cv2.cvtColor(img_rgb_model_sized, cv2.COLOR_GRAY2RGB)
+            elif img_rgb_model_sized.shape[2] == 4: # RGBA
+                debug_print("Preprocess: RGBA frame detected, converting to RGB for model.")
+                img_rgb_model_sized = cv2.cvtColor(img_rgb_model_sized, cv2.COLOR_RGBA2RGB)
+            
+            if img_rgb_model_sized.shape[2] != 3:
+                debug_print(f"Preprocess: Frame does not have 3 channels after processing! Shape: {img_rgb_model_sized.shape}. Skipping.")
+                continue
+
+            img_chw = img_rgb_model_sized.transpose(2, 0, 1) # HWC to CHW
+            img_chw_contiguous = np.ascontiguousarray(img_chw) # Ensure memory is contiguous
+            preprocessed_tensors_list.append(img_chw_contiguous)
+
+        if not preprocessed_tensors_list:
+            debug_print("Preprocess: No tensors to stack after processing batch.")
+            return None
+
+        try:
+            batch_np_stacked = np.stack(preprocessed_tensors_list)
+        except ValueError as e:
+            debug_print(f"Preprocess: Error stacking tensors: {e}. Individual tensor shapes:")
+            for i, t in enumerate(preprocessed_tensors_list):
+                debug_print(f"  Tensor {i}: shape={t.shape}, dtype={t.dtype}")
+            return None
+
+        # Convert to PyTorch tensor, ensure correct dtype and normalization
+        # Readers should provide uint8 [0-255] frames.
+        batch_tensor_from_np = torch.from_numpy(batch_np_stacked).to(self.device)
+        
+        if batch_tensor_from_np.dtype != torch.uint8:
+             debug_print(f"Preprocess: Warning! Tensor from numpy is not uint8, it's {batch_tensor_from_np.dtype}. Clamping and converting.")
+             # Handle potential float inputs if a reader behaves unexpectedly
+             batch_tensor_from_np = torch.clamp(batch_tensor_from_np, 0, 255).to(torch.uint8)
+
+        dtype_final = torch.float16 if (MIXED_PRECISION and self.device == 'cuda') else torch.float32
+        final_batch_tensor = batch_tensor_from_np.to(dtype_final) / 255.0 # Normalize to [0,1]
+        
+        return final_batch_tensor
 
     def _process_inference_results(self, results, frames_batch, frame_numbers, frame_times, start_datetime):
         """
@@ -302,7 +570,7 @@ class VideoProcessor:
 
         def process_single_frame(idx):
             result = results[idx]
-            original_frame = frames_batch[idx]
+            original_frame = frames_batch[idx][0]
             frame_number = frame_numbers[idx]
             frame_time_sec = frame_times[idx]
             current_timestamp = start_datetime + timedelta(seconds=frame_time_sec)
@@ -560,15 +828,23 @@ class VideoProcessor:
         # Reset state
         self.vehicle_tracker = VehicleTracker(); self.zone_tracker = None
         self.perf = PerformanceTracker(enabled=ENABLE_DETAILED_PERFORMANCE_METRICS)
-        self.stop_event = threading.Event(); self.frame_read_queue = queue.Queue(maxsize=self.batch_size*4)
+        self.stop_event = threading.Event()
+        self.frame_read_queue = queue.Queue(maxsize=max(self.batch_size * 4, 64))
         self.last_cleanup_time = time.monotonic()
-        self.detection_zones_polygons = None;
-        output_path = None # Will be defined only if writing video
-        self.final_output_path = None # Reset actual output path
-        self.writer_thread = None # Ensure writer thread is None initially
-        self.video_write_queue = None # Ensure writer queue is None initially
+        self.detection_zones_polygons = None
+        output_path = None
+        self.final_output_path = None
+        self.writer_thread = None
+        self.video_write_queue = None
 
-        print(f"--- Starting New Video Processing Run ---"); print(f"Video: {video_path}"); print(f"Timestamp: {start_date_str} {start_time_str}"); print(f"Zone Mode: {self.line_mode.upper()}"); print(f"Visualization Enabled: {ENABLE_VISUALIZATION}")
+        print(f"--- Starting New Video Processing Run ---"); 
+        print(f"Video: {video_path}"); 
+        print(f"Timestamp: {start_date_str} {start_time_str}"); 
+        print(f"Zone Mode: {self.line_mode.upper()}"); 
+        print(f"Visualization Enabled: {ENABLE_VISUALIZATION}")
+        print(f"PVR Segment Size (config): {self.pvr_decode_segment_size}")
+        print(f"Use Advanced Reader (config): {USE_ADVANCED_VIDEO_READER}")
+        print(f"PyVideoReader Available (import status): {PYVIDEOREADER_AVAILABLE}")
 
         if primary_direction:
              print(f"Primary Direction for Report: {primary_direction.capitalize()}")
@@ -612,15 +888,26 @@ class VideoProcessor:
                 start_time=base_time.replace(microsecond=microseconds); start_datetime=datetime.combine(start_date.date(), start_time)
                 print(f"Video Start Timestamp: {start_datetime.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}")
             except ValueError as e: raise ValueError(f"Invalid date/time format: {e}.")
-            cap_check=cv2.VideoCapture(video_path);
-            if not cap_check.isOpened(): raise FileNotFoundError(f"Cannot open video: {video_path}")
-            original_fps=cap_check.get(cv2.CAP_PROP_FPS); total_frames=int(cap_check.get(cv2.CAP_PROP_FRAME_COUNT)); cap_check.release()
-            if original_fps <= 0: print(f"Warn: Invalid FPS ({original_fps}). Assuming 30."); original_fps = 30.0
+
+            # Get video properties (total_frames, original_fps)
+            total_frames, original_fps = self._get_video_properties(video_path)
             print(f"Video Properties: ~{total_frames} frames, {original_fps:.2f} FPS (Original)")
+            if total_frames <= 0:
+                 print("CRITICAL: Total frames is zero or negative. Video might be empty or properties unreadable.")
+                 raise ValueError("Cannot process video with zero or unreadable total frames.")
 
             # --- Setup Output Path and Start Threads (Writer only if ENABLE_VISUALIZATION) ---
-            print("Starting I/O threads...");
-            self.reader_thread = threading.Thread(target=self._frame_reader_task, args=(video_path, original_fps), daemon=True)
+            print("Starting I/O threads...")
+            if self.actually_use_advanced_reader:
+                self.reader_thread = threading.Thread(
+                    target=self._frame_reader_task_pvr_segmented,
+                    args=(video_path, original_fps, total_frames),
+                    daemon=True)
+            else: 
+                self.reader_thread = threading.Thread(
+                    target=self._frame_reader_task, 
+                    args=(video_path, original_fps),
+                    daemon=True)
             self.reader_thread.start()
 
             if ENABLE_VISUALIZATION:
@@ -642,32 +929,38 @@ class VideoProcessor:
 
             # --- Main Loop ---
             all_detections = []; frames_processed_count = 0
-            frame_interval = max(1, round(original_fps / self.target_fps))
-            total_target_frames = total_frames // frame_interval if frame_interval > 0 and total_frames > 0 else total_frames
-            if self.perf: self.perf.start_processing(total_target_frames)
-            frames_batch, frame_numbers_batch, frame_times_batch = [], [], []
+            frame_interval = max(1, round(original_fps / self.target_fps)) if self.target_fps > 0 and original_fps > 0 else 1
+            total_target_frames_for_perf = total_frames // frame_interval if total_frames > 0 else 0
+            if self.perf: self.perf.start_processing(total_target_frames_for_perf if total_target_frames_for_perf > 0 else total_frames)
+            frames_batch_with_metadata, frame_numbers_batch, frame_times_batch = [], [], []
             last_progress_print_time = time.monotonic(); print(f"Target FPS: {self.target_fps:.1f}, Processing every ~{frame_interval} frame(s).")
 
             while True:
                 try:
-                    frame_data = self.frame_read_queue.get(timeout=60) # Wait for frame from reader
-                    if frame_data is None: self.frame_read_queue.task_done(); break # End signal from reader
+                    frame_data_from_queue = self.frame_read_queue.get(timeout=60) # Wait for frame from reader
+                    if frame_data_from_queue is None: self.frame_read_queue.task_done(); break # End signal from reader
                     if self.perf: self.perf.start_timer('video_read')
-                    frame, frame_number, frame_time_sec = frame_data
+                    frame_content, frame_number, frame_time_sec, metadata = frame_data_from_queue
                     if self.perf: self.perf.end_timer('video_read')
-                    if frame is None: self.frame_read_queue.task_done(); continue
+                    if frame_content is None: self.frame_read_queue.task_done(); continue
 
-                    frames_batch.append(frame); frame_numbers_batch.append(frame_number); frame_times_batch.append(frame_time_sec)
+                    frames_batch_with_metadata.append((frame_content, metadata))
+                    frame_numbers_batch.append(frame_number)
+                    frame_times_batch.append(frame_time_sec)
+
+                    # if hasattr(self.frame_read_queue, 'task_done'): self.frame_read_queue.task_done() # Mark item as processed from queue
 
                     # Process when batch is full
-                    if len(frames_batch) >= self.batch_size:
+                    if len(frames_batch_with_metadata) >= self.batch_size:
                         batch_start_mono = time.monotonic()
-                        if self.perf: self.perf.start_timer('preprocessing'); input_batch = self._preprocess_batch(frames_batch); self.perf.end_timer('preprocessing')
+                        if self.perf: self.perf.start_timer('preprocessing')
+                        input_batch_tensor = self._preprocess_batch(frames_batch_with_metadata)
+                        self.perf.end_timer('preprocessing')
 
-                        if input_batch is None or input_batch.nelement() == 0:
-                            debug_print("Skipping empty batch.");
-                            frames_batch.clear(); frame_numbers_batch.clear(); frame_times_batch.clear()
-                            for _ in range(len(frames_batch)): self.frame_read_queue.task_done()
+                        if input_batch_tensor is None or input_batch_tensor.nelement() == 0:
+                            debug_print("Skipping empty batch.")
+                            frames_batch_with_metadata.clear(); frame_numbers_batch.clear(); frame_times_batch.clear()
+                            for _ in range(len(frames_batch_with_metadata)): self.frame_read_queue.task_done()
                             continue
 
                         # Inference
@@ -676,13 +969,13 @@ class VideoProcessor:
                         with torch.cuda.stream(stream) if stream else torch.no_grad():
                            with torch.amp.autocast(device_type=self.device,enabled=MIXED_PRECISION and self.device=='cuda'):
                              if self.perf and self.perf.start_event: self.perf.start_event.record(stream=stream)
-                             results=self.model(input_batch,verbose=False);
+                             results=self.model(input_batch_tensor,verbose=False);
                              if self.perf and self.perf.end_event: self.perf.end_event.record(stream=stream)
                         if stream: stream.synchronize()
                         if self.perf and self.perf.start_event: self.perf.record_inference_time_gpu(self.perf.start_event, self.perf.end_event)
 
                         # Post-process (gets logs and processed frames/Nones)
-                        batch_log, processed_frames = self._process_inference_results(results, frames_batch, frame_numbers_batch, frame_times_batch, start_datetime)
+                        batch_log, processed_frames = self._process_inference_results(results, frames_batch_with_metadata, frame_numbers_batch, frame_times_batch, start_datetime)
                         all_detections.extend(batch_log)
                         if self.perf: self.perf.record_detection(sum(len(r.boxes) for r in results if hasattr(r,'boxes') and r.boxes))
 
@@ -698,8 +991,8 @@ class VideoProcessor:
                             if self.perf: self.perf.end_timer('video_write')
 
                         # Stats & Cleanup
-                        batch_time = time.monotonic() - batch_start_mono; frames_processed_count += len(frames_batch)
-                        if self.perf: self.perf.record_batch_processed(len(frames_batch), batch_time); self.perf.sample_system_metrics()
+                        batch_time = time.monotonic() - batch_start_mono; frames_processed_count += len(frames_batch_with_metadata)
+                        if self.perf: self.perf.record_batch_processed(len(frames_batch_with_metadata), batch_time); self.perf.sample_system_metrics()
                         current_mono_time = time.monotonic()
                         if current_mono_time - self.last_cleanup_time > MEMORY_CLEANUP_INTERVAL:
                             if self.perf: self.perf.start_timer('memory_cleanup')
@@ -714,30 +1007,35 @@ class VideoProcessor:
                             last_progress_print_time = current_mono_time
 
                         # Clear Batch
-                        frames_batch.clear(); frame_numbers_batch.clear(); frame_times_batch.clear(); del input_batch, results; cleanup_memory()
+                        frames_batch_with_metadata.clear(); frame_numbers_batch.clear(); frame_times_batch.clear(); del input_batch_tensor, results; cleanup_memory()
 
                     # Mark frame as processed in reader queue
                     self.frame_read_queue.task_done()
-                except queue.Empty: print("\nWarning: Frame reader queue timed out."); break # Exit if reader seems stuck
+                except queue.Empty: 
+                    debug_print("Main loop: Frame reader queue timed out.")
+                    if self.stop_event.is_set() and (self.frame_read_queue is None or self.frame_read_queue.empty()): # Check if reader actually finished
+                        debug_print("Main loop: Stop event set and queue empty. Ending loop.")
+                        break
+                    continue 
                 except Exception as e: print(f"\nERROR during processing loop: {e}"); import traceback; traceback.print_exc(); self.stop_event.set(); break
 
             # --- Process Final Batch ---
-            if frames_batch:
+            if frames_batch_with_metadata:
                 print("\nProcessing final batch...")
                 batch_start_mono=time.monotonic()
-                if self.perf: self.perf.start_timer('preprocessing'); input_batch=self._preprocess_batch(frames_batch); self.perf.end_timer('preprocessing')
-                if input_batch is not None and input_batch.nelement() > 0:
+                if self.perf: self.perf.start_timer('preprocessing'); input_batch_tensor=self._preprocess_batch(frames_batch_with_metadata); self.perf.end_timer('preprocessing')
+                if input_batch_tensor is not None and input_batch_tensor.nelement() > 0:
                     stream=None; idx=0;
                     if self.device=='cuda' and self.streams: stream=self.streams[self.current_stream_index%len(self.streams)]; idx=self.current_stream_index; self.current_stream_index+=1
                     with torch.cuda.stream(stream) if stream else torch.no_grad():
                         with torch.amp.autocast(device_type=self.device,enabled=MIXED_PRECISION and self.device=='cuda'):
                            if self.perf and self.perf.start_event: self.perf.start_event.record(stream=stream)
-                           results=self.model(input_batch,verbose=False);
+                           results=self.model(input_batch_tensor,verbose=False);
                            if self.perf and self.perf.end_event: self.perf.end_event.record(stream=stream)
                         if stream: stream.synchronize()
                         if self.perf and self.perf.start_event: self.perf.record_inference_time_gpu(self.perf.start_event, self.perf.end_event)
 
-                    batch_log, processed_frames = self._process_inference_results(results, frames_batch, frame_numbers_batch, frame_times_batch, start_datetime)
+                    batch_log, processed_frames = self._process_inference_results(results, frames_batch_with_metadata, frame_numbers_batch, frame_times_batch, start_datetime)
                     all_detections.extend(batch_log)
 
                     # Write final frames if visualization enabled
@@ -751,9 +1049,9 @@ class VideoProcessor:
                                     print("WARN: Video writer queue full during final batch, frame dropped.")
                         if self.perf: self.perf.end_timer('video_write')
 
-                    batch_time=time.monotonic()-batch_start_mono; frames_processed_count+=len(frames_batch)
-                    if self.perf: self.perf.record_batch_processed(len(frames_batch),batch_time)
-                    del input_batch, results; cleanup_memory()
+                    batch_time=time.monotonic()-batch_start_mono; frames_processed_count+=len(frames_batch_with_metadata)
+                    if self.perf: self.perf.record_batch_processed(len(frames_batch_with_metadata),batch_time)
+                    del input_batch_tensor, results; cleanup_memory()
                 else: debug_print("Skipping empty final batch.")
             print("\nVideo processing loop finished.")
 

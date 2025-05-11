@@ -4,8 +4,8 @@ from datetime import datetime
 import torch # Import torch to check GPU capability
 
 PROCESSING_MODE = 'enhanced'
-LINE_MODE = 'interactive'
-ENABLE_VISUALIZATION = True
+LINE_MODE = 'hardcoded'
+ENABLE_VISUALIZATION = False
 
 # --- Input Settings (primarily for hardcoded mode) ---
 INPUT_VIDEO_PATH = "C:/Users/EMAAN/Documents/YOLO/5 minute test - 4 Way Intersection.mp4"
@@ -57,6 +57,8 @@ VALID_MOVEMENTS = { 'north': ['south','east','west'], 'south': ['north','east','
 if MODEL_INPUT_SIZE >= 640: _default_batch = 16 if PROCESSING_MODE == 'standard' else 32
 else: _default_batch = 32 if PROCESSING_MODE == 'standard' else 128 # Keep larger for 320
 OPTIMAL_BATCH_SIZE = _default_batch
+USE_ADVANCED_VIDEO_READER = True 
+PYVIDEOREADER_DECODE_SEGMENT_SIZE = 7500
 
 _cpu_count = os.cpu_count(); THREAD_COUNT = min(64, _cpu_count * 2) if _cpu_count else 24
 MIXED_PRECISION = True if PROCESSING_MODE == 'enhanced' and torch.cuda.is_available() else False
