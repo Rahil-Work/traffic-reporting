@@ -555,7 +555,6 @@ class VideoProcessor:
         and generates structured event logs. Returns logs and processed frames (if visualization enabled).
         """
         batch_detections_list = [[] for _ in range(len(frames_batch))]
-        # Initialize with original frames or None, depending on visualization
         processed_frames_list = [None] * len(frames_batch) # Will hold visualized frames if enabled
         tracker_lock = self.tracker_lock
 
@@ -564,177 +563,260 @@ class VideoProcessor:
             original_frame = frames_batch[idx][0]
             frame_number = frame_numbers[idx]
             frame_time_sec = frame_times[idx]
-            current_timestamp = start_datetime + timedelta(seconds=frame_time_sec)
+            current_timestamp_dt = start_datetime + timedelta(seconds=frame_time_sec)
 
-            # Prepare output frame *only if* visualization is enabled
             output_frame = None
             if ENABLE_VISUALIZATION:
-                 # Start with a resized copy for drawing
                  output_frame = cv2.resize(original_frame.copy(), self.frame_shape)
 
-            frame_local_detections = [] # Logs for this frame
+            frame_local_detections_log = [] # Logs for this frame
 
             if not self.vehicle_tracker or not self.zone_tracker:
                 # Return empty logs and the (potentially None) output frame
                 return [], output_frame
 
             # 1. Process raw detections
-            detections_this_frame = []
-            ids_processed_this_frame_map = {}
+            detections_for_tracker = []
             if hasattr(result, 'boxes') and result.boxes is not None:
                 for box in result.boxes:
                     cls_id = int(box.cls[0])
                     v_type_name_current = result.names.get(cls_id, f"CLS_{cls_id}")
-                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                    model_h, model_w = result.orig_shape
-                    out_h, out_w = self.frame_shape[1], self.frame_shape[0]
-                    x1o = max(0, int(x1 * out_w / model_w))
-                    y1o = max(0, int(y1 * out_h / model_h))
-                    x2o = min(out_w - 1, int(x2 * out_w / model_w))
-                    y2o = min(out_h - 1, int(y2 * out_h / model_h))
-                    center_pt = ((x1o + x2o) // 2, (y1o + y2o) // 2)
-                    detections_this_frame.append({
-                        'box_coords': (x1o, y1o, x2o, y2o),
-                        'center': center_pt,
-                        'type': v_type_name_current
+                    x1m, y1m, x2m, y2m = box.xyxy[0].cpu().numpy() # Model coordinates
+                    
+                    # Scale to output/original frame for tracker and visualization logic
+                    # This assumes result.orig_shape is the size of the image fed to the model (e.g., 416x416)
+                    # And self.frame_shape is the target display/processing size (e.g., 640x480)
+                    model_h, model_w = result.orig_shape # e.g. (416, 416)
+                    out_h, out_w = self.frame_shape[1], self.frame_shape[0] # e.g. (480, 640)
+
+                    x1o = max(0, int(x1m * out_w / model_w))
+                    y1o = max(0, int(y1m * out_h / model_h))
+                    x2o = min(out_w - 1, int(x2m * out_w / model_w))
+                    y2o = min(out_h - 1, int(y2m * out_h / model_h))
+                    
+                    center_pt_tracker = ((x1o + x2o) // 2, (y1o + y2o) // 2)
+                    
+                    detections_for_tracker.append({
+                        'box_coords_orig_scale': (x1o, y1o, x2o, y2o), # For ZoneTracker and visualization
+                        'center_orig_scale': center_pt_tracker,     # For tracker matching
+                        'type_raw': v_type_name_current              # Raw type from model
                     })
 
-            # 2. Update Tracker and Check Zones (within lock)
-            ids_seen_in_lock = set()
-            ids_to_remove_this_frame = set()
+            # This map will store data about detections matched/assigned IDs in this frame
+            # Key: vehicle_id, Value: {dict with center, box, type, event_marker, status}
+            current_frame_vehicle_map = {} 
+            ids_seen_by_tracker_this_frame = set()
+
+
+            # --- Tracking and Zone Logic (within lock) ---
             with tracker_lock:
                 if self.perf: self.perf.start_timer('tracking_update')
 
-                # Update tracker
-                for det_info in detections_this_frame:
-                    center_point, v_type_name_current = det_info['center'], det_info['type']
+                # 1. Match detections to existing tracks or create new ones
+                for det_info in detections_for_tracker:
+                    center_point = det_info['center_orig_scale']
+                    raw_type = det_info['type_raw']
+                    
                     matched_id = self.vehicle_tracker.find_best_match(center_point, frame_time_sec)
-                    v_id, consistent_type = self.vehicle_tracker.update_track(
-                        matched_id if matched_id else self.vehicle_tracker._get_next_id(),
-                        center_point, frame_time_sec, v_type_name_current
-                    )
-                    ids_processed_this_frame_map[v_id] = {
-                        'center': center_point, 'box': det_info['box_coords'],
-                        'type': consistent_type, 'event': None, 'status': 'detected'
-                    }
-                    ids_seen_in_lock.add(v_id)
+                    
+                    current_v_id, consistent_type = None, None
+                    if matched_id:
+                        current_v_id, consistent_type = self.vehicle_tracker.update_track(
+                            matched_id, center_point, frame_time_sec, raw_type
+                        )
+                    else:
+                        new_id = self.vehicle_tracker._get_next_id()
+                        # Register new track (which also calls update_track internally or similar logic)
+                        # For a brand new ID, register_entry should be called if it enters a zone,
+                        # otherwise, update_track just establishes its presence.
+                        # We'll let zone checking below call register_entry. For now, establish the track.
+                        current_v_id, consistent_type = self.vehicle_tracker.update_track(
+                            new_id, center_point, frame_time_sec, raw_type
+                        )
+                    
+                    if current_v_id and consistent_type: # If update_track was successful
+                        ids_seen_by_tracker_this_frame.add(current_v_id)
+                        current_frame_vehicle_map[current_v_id] = {
+                            'center': center_point,
+                            'box': det_info['box_coords_orig_scale'],
+                            'type': consistent_type, # Use the consistent type
+                            'event_marker': None,
+                            'status_for_drawing': 'detected' # Initial status for drawing
+                        }
+                    elif matched_id and not current_v_id : # Matched an ID but update_track failed (e.g. was completed)
+                         debug_print(f"Tracker Info: Matched V:{matched_id} but it was already completed. Detection at {center_point} will be a new ID if it enters a zone.")
+                         # This detection will be handled as a new track if it enters a zone.
 
-                # Check zone transitions
-                for v_id in list(ids_processed_this_frame_map.keys()):
-                    current_data = ids_processed_this_frame_map[v_id]
-                    center_point, current_bbox_coords, consistent_type = current_data['center'], current_data['box'], current_data['type']
-                    prev_pos = None
-                    if v_id in self.vehicle_tracker.tracking_history and len(self.vehicle_tracker.tracking_history[v_id]) > 1:
-                        prev_pos = self.vehicle_tracker.tracking_history[v_id][-2]
+                # 2. Zone Transition Checks
+                # Iterate over a copy of keys if the map might change due to new IDs from inferred exits
+                # However, current_frame_vehicle_map only contains IDs *active or newly detected* in this frame.
+                # An inferred exit will retire an OLD ID and create a NEW one.
+                
+                vehicle_ids_in_map_this_frame = list(current_frame_vehicle_map.keys())
 
-                    if prev_pos and self.zone_tracker and self.zone_tracker.zones:
+                for v_id_being_checked in vehicle_ids_in_map_this_frame:
+                    # Ensure vehicle_id is still valid and its data exists
+                    if v_id_being_checked not in current_frame_vehicle_map:
+                        continue # Might have been processed/replaced by an inferred exit's new ID
+
+                    vehicle_data_this_frame = current_frame_vehicle_map[v_id_being_checked]
+                    center_pt_curr = vehicle_data_this_frame['center']
+                    bbox_curr = vehicle_data_this_frame['box']
+                    v_type_curr = vehicle_data_this_frame['type']
+
+                    prev_pos_tracker = None
+                    if v_id_being_checked in self.vehicle_tracker.tracking_history and \
+                       len(self.vehicle_tracker.tracking_history[v_id_being_checked]) > 1:
+                        # Get the second to last point as the "previous" position before this frame's update
+                        prev_pos_tracker = self.vehicle_tracker.tracking_history[v_id_being_checked][-2]
+                    
+                    # Check zone transition only if we have a previous position
+                    if prev_pos_tracker and self.zone_tracker and self.zone_tracker.zones:
                         if self.perf: self.perf.start_timer('zone_checking')
                         event_type, event_dir = self.zone_tracker.check_zone_transition(
-                            prev_pos, current_bbox_coords, v_id, frame_time_sec
+                            prev_pos_tracker, bbox_curr, v_id_being_checked, frame_time_sec
                         )
                         if self.perf: self.perf.end_timer('zone_checking')
 
                         if event_type == "ENTRY":
-                            v_state = self.vehicle_tracker.active_vehicles.get(v_id)
-                            is_active = v_state and v_state.get('status') == 'active'
-                            stored_entry_dir = v_state.get('entry_direction') if v_state else None
+                            # Is this vehicle_id currently 'active' in the tracker from a *different* zone?
+                            vehicle_state_in_tracker = self.vehicle_tracker.active_vehicles.get(v_id_being_checked)
+                            is_currently_active_elsewhere = (
+                                vehicle_state_in_tracker and
+                                vehicle_state_in_tracker.get('status') == 'active' and
+                                vehicle_state_in_tracker.get('entry_direction') != event_dir # Entering a NEW zone
+                            )
+                            
+                            active_zone_keys = list(self.zone_tracker.zones.keys())
 
-                            # Handle INFERRED EXIT (Entering a NEW valid zone while already active)
-                            if is_active and stored_entry_dir and stored_entry_dir != event_dir:
-                                active_zone_keys = list(self.zone_tracker.zones.keys())
-                                if is_valid_movement(stored_entry_dir, event_dir, active_zone_keys):
-                                    print(f"INFO: V:{v_id} Inferred Exit logic triggered. Entered '{event_dir}' while active from '{stored_entry_dir}'.")
-                                    final_type_inferred = self.vehicle_tracker.get_final_consistent_type(v_id) if hasattr(self.vehicle_tracker, 'get_final_consistent_type') else consistent_type
-                                    success_inf, t_in_int_inf = self.vehicle_tracker.register_exit(v_id, event_dir, current_timestamp, center_point)
-                                    if success_inf:
-                                        if self.perf: self.perf.record_vehicle_exit('exited', t_in_int_inf)
-                                        frame_local_detections.append({
-                                            'timestamp_dt': current_timestamp, 'vehicle_id': v_id,
-                                            'vehicle_type': final_type_inferred, 'event_type': 'EXIT',
-                                            'direction_from': stored_entry_dir, 'direction_to': event_dir,
-                                            'status': 'exited_inferred', 'time_in_intersection': t_in_int_inf,
-                                            'frame_number': frame_number
-                                        })
-                                        ids_to_remove_this_frame.add(v_id)
-                                        ids_processed_this_frame_map[v_id]['event'] = 'EXIT' # Mark for drawing
-                                    # Now, fall through to register the *new* entry
-                                    if self.vehicle_tracker.register_entry(v_id, event_dir, current_timestamp, center_point, consistent_type):
-                                        if self.perf: self.perf.record_vehicle_entry()
-                                        ids_processed_this_frame_map[v_id]['event'] = 'ENTRY' # Override event marker for drawing
-                                        frame_local_detections.append({
-                                            'timestamp_dt': current_timestamp, 'vehicle_id': v_id,
-                                            'vehicle_type': consistent_type, 'event_type': 'ENTRY',
-                                            'direction_from': event_dir, 'direction_to': None,
-                                            'status': 'entry', 'frame_number': frame_number
-                                        })
+                            if is_currently_active_elsewhere and \
+                               is_valid_movement(vehicle_state_in_tracker['entry_direction'], event_dir, active_zone_keys):
+                                # === INFERRED EXIT SCENARIO ===
+                                # Vehicle v_id_being_checked is exiting its old zone and entering event_dir
+                                old_entry_dir = vehicle_state_in_tracker['entry_direction']
+                                debug_print(f"INFO: V:{v_id_being_checked} Inferred Exit. Was in '{old_entry_dir}', now entering '{event_dir}'.")
 
-                                else: # Invalid inferred movement (e.g., U-turn)
-                                    print(f"INFO: V:{v_id} Invalid inferred movement '{stored_entry_dir}' -> '{event_dir}'. Ignoring.")
-                                    pass
+                                # 1. Finalize and retire the old v_id_being_checked
+                                success_inf_exit, t_in_int_inf = self.vehicle_tracker.register_exit(
+                                    v_id_being_checked, event_dir, current_timestamp_dt, center_pt_curr
+                                )
+                                if success_inf_exit:
+                                    if self.perf: self.perf.record_vehicle_exit('exited', t_in_int_inf)
+                                    # Log the exit of the old ID
+                                    # Retrieve final type from completed_paths as register_exit might modify it
+                                    completed_old_path_entry = next((p for p in reversed(self.vehicle_tracker.completed_paths) if p.get('id') == v_id_being_checked), None)
+                                    final_old_id_type = v_type_curr # Fallback
+                                    if completed_old_path_entry: final_old_id_type = completed_old_path_entry.get('type', v_type_curr)
 
-                            # Handle STANDARD ENTRY (or re-entry if inferred exit didn't apply)
-                            elif self.vehicle_tracker.register_entry(v_id, event_dir, current_timestamp, center_point, consistent_type):
-                                if self.perf: self.perf.record_vehicle_entry()
-                                ids_processed_this_frame_map[v_id]['event'] = 'ENTRY'
-                                frame_local_detections.append({
-                                    'timestamp_dt': current_timestamp, 'vehicle_id': v_id,
-                                    'vehicle_type': consistent_type, 'event_type': 'ENTRY',
-                                    'direction_from': event_dir, 'direction_to': None,
-                                    'status': 'entry', 'frame_number': frame_number
-                                })
-
-                        elif event_type == "EXIT":
-                            entry_dir_trk = self.vehicle_tracker.active_vehicles.get(v_id, {}).get('entry_direction')
-                            entry_time_stored = self.vehicle_tracker.active_vehicles.get(v_id, {}).get('entry_time')
-                            active_zone_keys = list(self.zone_tracker.zones.keys()) if self.zone_tracker and self.zone_tracker.zones else []
-                            is_valid = is_valid_movement(entry_dir_trk, event_dir, active_zone_keys)
-
-                            if entry_dir_trk and is_valid and entry_time_stored and current_timestamp >= entry_time_stored:
-                                success, t_in_int = self.vehicle_tracker.register_exit(v_id, event_dir, current_timestamp, center_point)
-                                if success:
-                                    if self.perf: self.perf.record_vehicle_exit('exited', t_in_int)
-                                    # Retrieve final type stored by register_exit
-                                    final_exit_type = 'UnknownType'
-                                    completed_path_entry = next((p for p in reversed(self.vehicle_tracker.completed_paths) if p.get('id') == v_id and p.get('status') == 'exited'), None)
-                                    if completed_path_entry: final_exit_type = completed_path_entry.get('type', 'UnknownType')
-
-                                    frame_local_detections.append({
-                                        'timestamp_dt': current_timestamp, 'vehicle_id': v_id,
-                                        'vehicle_type': final_exit_type, 'event_type': 'EXIT',
-                                        'direction_from': entry_dir_trk, 'direction_to': event_dir,
-                                        'status': 'exit', 'time_in_intersection': t_in_int,
+                                    frame_local_detections_log.append({
+                                        'timestamp_dt': current_timestamp_dt, 'vehicle_id': v_id_being_checked,
+                                        'vehicle_type': final_old_id_type, 'event_type': 'EXIT',
+                                        'direction_from': old_entry_dir, 'direction_to': event_dir,
+                                        'status': 'exited_inferred', 'time_in_intersection': t_in_int_inf,
                                         'frame_number': frame_number
                                     })
-                                    ids_to_remove_this_frame.add(v_id)
-                                    ids_processed_this_frame_map[v_id]['event'] = 'EXIT'
-                            elif is_valid: # Valid movement but time issue
-                                 print(f"WARN: V:{v_id} Explicit Exit ignored. Time invalid: Entry={entry_time_stored}, Exit={current_timestamp}")
+                                    # Mark old ID for drawing as exiting
+                                    if v_id_being_checked in current_frame_vehicle_map: # Should exist
+                                        current_frame_vehicle_map[v_id_being_checked]['event_marker'] = 'EXIT'
+                                        current_frame_vehicle_map[v_id_being_checked]['status_for_drawing'] = 'exiting'
+                                
+                                # 2. Create a NEW ID for the entry into the new zone (event_dir)
+                                new_inferred_entry_id = self.vehicle_tracker._get_next_id()
+                                # The detection (center_pt_curr, bbox_curr, v_type_curr) is now for new_inferred_entry_id
+                                
+                                # Update tracker with this new ID (associates detection with new ID)
+                                self.vehicle_tracker.update_track(new_inferred_entry_id, center_pt_curr, frame_time_sec, v_type_curr) # v_type_curr is the consistent type from current detection
+                                ids_seen_by_tracker_this_frame.add(new_inferred_entry_id) # Add to seen this frame
+
+                                # Register entry for the NEW ID
+                                if self.vehicle_tracker.register_entry(new_inferred_entry_id, event_dir, current_timestamp_dt, center_pt_curr, v_type_curr):
+                                    if self.perf: self.perf.record_vehicle_entry()
+                                    frame_local_detections_log.append({
+                                        'timestamp_dt': current_timestamp_dt, 'vehicle_id': new_inferred_entry_id,
+                                        'vehicle_type': v_type_curr, 'event_type': 'ENTRY',
+                                        'direction_from': event_dir, 'direction_to': None,
+                                        'status': 'entry', 'frame_number': frame_number
+                                    })
+                                    # Update current_frame_vehicle_map with the NEW ID for drawing
+                                    current_frame_vehicle_map[new_inferred_entry_id] = {
+                                        'center': center_pt_curr, 'box': bbox_curr, 'type': v_type_curr,
+                                        'event_marker': 'ENTRY', 'status_for_drawing': 'entering'
+                                    }
+                                    # Remove the old v_id_being_checked from this frame's processing map if it wasn't used for drawing exit
+                                    # current_frame_vehicle_map.pop(v_id_being_checked, None) # Not strictly needed as it won't be used further for new ID
+                                else:
+                                     debug_print(f"WARN: Inferred Exit: Failed to register_entry for NEW ID {new_inferred_entry_id}")
+                            
+                            elif not is_currently_active_elsewhere: # Standard Entry for v_id_being_checked
+                                if self.vehicle_tracker.register_entry(v_id_being_checked, event_dir, current_timestamp_dt, center_pt_curr, v_type_curr):
+                                    if self.perf: self.perf.record_vehicle_entry()
+                                    frame_local_detections_log.append({
+                                        'timestamp_dt': current_timestamp_dt, 'vehicle_id': v_id_being_checked,
+                                        'vehicle_type': v_type_curr, 'event_type': 'ENTRY',
+                                        'direction_from': event_dir, 'direction_to': None,
+                                        'status': 'entry', 'frame_number': frame_number
+                                    })
+                                    current_frame_vehicle_map[v_id_being_checked]['event_marker'] = 'ENTRY'
+                                    current_frame_vehicle_map[v_id_being_checked]['status_for_drawing'] = 'entering'
+                                # else: an attempt to register_entry for an already active (in the same zone) or completed ID failed. This is expected.
+                            # else: Invalid movement for inferred exit or re-entry into same zone.
+
+                        elif event_type == "EXIT":
+                            # Standard EXIT for v_id_being_checked
+                            vehicle_state_in_tracker = self.vehicle_tracker.active_vehicles.get(v_id_being_checked)
+                            if vehicle_state_in_tracker and vehicle_state_in_tracker.get('status') == 'active':
+                                entry_dir_trk = vehicle_state_in_tracker.get('entry_direction')
+                                active_zone_keys = list(self.zone_tracker.zones.keys()) if self.zone_tracker and self.zone_tracker.zones else []
+                                
+                                if entry_dir_trk and is_valid_movement(entry_dir_trk, event_dir, active_zone_keys):
+                                    success_exit, t_in_int_exit = self.vehicle_tracker.register_exit(
+                                        v_id_being_checked, event_dir, current_timestamp_dt, center_pt_curr
+                                    )
+                                    if success_exit:
+                                        if self.perf: self.perf.record_vehicle_exit('exited', t_in_int_exit)
+                                        completed_path_entry = next((p for p in reversed(self.vehicle_tracker.completed_paths) if p.get('id') == v_id_being_checked), None)
+                                        final_exit_type = v_type_curr
+                                        if completed_path_entry: final_exit_type = completed_path_entry.get('type', v_type_curr)
+
+                                        frame_local_detections_log.append({
+                                            'timestamp_dt': current_timestamp_dt, 'vehicle_id': v_id_being_checked,
+                                            'vehicle_type': final_exit_type, 'event_type': 'EXIT',
+                                            'direction_from': entry_dir_trk, 'direction_to': event_dir,
+                                            'status': 'exit', 'time_in_intersection': t_in_int_exit,
+                                            'frame_number': frame_number
+                                        })
+                                        current_frame_vehicle_map[v_id_being_checked]['event_marker'] = 'EXIT'
+                                        current_frame_vehicle_map[v_id_being_checked]['status_for_drawing'] = 'exiting'
+                                # else: Invalid exit movement or vehicle not in a state to exit.
+                            # else: Vehicle not active for standard exit.
 
 
-                # Check timeouts
-                timed_out_ids = self.vehicle_tracker.check_timeouts(current_timestamp)
+                # 3. Check Timeouts
+                # This uses current_timestamp_dt (absolute datetime)
+                timed_out_ids = self.vehicle_tracker.check_timeouts(current_timestamp_dt)
                 for v_id_to in timed_out_ids:
-                    ids_to_remove_this_frame.add(v_id_to)
+                    # ID is already retired by check_timeouts and data moved to completed_paths
                     if self.perf: self.perf.record_vehicle_exit('timed_out')
-                    p_data = next((p for p in reversed(self.vehicle_tracker.completed_paths) if p['id']==v_id_to and p['status']=='timed_out'), None)
+                    p_data = next((p for p in reversed(self.vehicle_tracker.completed_paths) if p['id'] == v_id_to and p['status'] == 'timed_out'), None)
                     if p_data:
-                        frame_local_detections.append({
-                            'timestamp_dt': current_timestamp, 'vehicle_id': v_id_to,
+                        frame_local_detections_log.append({
+                            'timestamp_dt': current_timestamp_dt, 'vehicle_id': v_id_to,
                             'vehicle_type': p_data.get('type', 'UnknownType'), 'event_type': 'TIMEOUT',
                             'direction_from': p_data.get('entry_direction', 'UNKNOWN'), 'direction_to': 'TIMEOUT',
                             'status': 'timeout', 'time_in_intersection': p_data.get('time_in_intersection', 'N/A'),
                             'frame_number': frame_number
                         })
-                    if v_id_to in ids_processed_this_frame_map:
-                        ids_processed_this_frame_map[v_id_to]['status'] = 'timed_out'
+                    if v_id_to in current_frame_vehicle_map: # If it was detected in this frame before timeout
+                        current_frame_vehicle_map[v_id_to]['status_for_drawing'] = 'timed_out'
+                    # No need to add to ids_to_remove_this_frame, remove_vehicle_data is called by _finalize_and_complete_path
 
-                # Increment misses
-                self.vehicle_tracker.increment_misses(ids_seen_in_lock)
-
-                # Remove vehicles
-                for v_id_rem in ids_to_remove_this_frame:
-                    self.vehicle_tracker.remove_vehicle_data(v_id_rem)
-                    if self.zone_tracker: self.zone_tracker.remove_vehicle_data(v_id_rem)
+                # 4. Increment Misses for tracks not seen in this frame
+                # ids_seen_by_tracker_this_frame contains all IDs that got an update_track call.
+                self.vehicle_tracker.increment_misses(ids_seen_by_tracker_this_frame)
+                
+                # Note: vehicle_tracker.remove_vehicle_data() is now called internally by 
+                # _finalize_and_complete_path when an ID exits, times out, or is forced out.
+                # So, no explicit ids_to_remove_this_frame set is needed here for that purpose.
 
                 if self.perf: self.perf.end_timer('tracking_update')
             # --- End Lock ---
@@ -742,73 +824,82 @@ class VideoProcessor:
             # --- Drawing Pass (only if visualization enabled and output_frame exists) ---
             if ENABLE_VISUALIZATION and output_frame is not None:
                 if self.perf: self.perf.start_timer('drawing')
-                # Draw zones
                 if self.zone_tracker and self.zone_tracker.zones:
                     output_frame = visual_overlay.draw_zones(output_frame, self.zone_tracker)
 
-                active_vehicle_snapshot = self.vehicle_tracker.active_vehicles.copy()
+                # Iterate through vehicles that were active or detected in this frame for drawing
+                for v_id_draw, data_draw in current_frame_vehicle_map.items():
+                    if self.vehicle_tracker.completed_vehicle_ids and \
+                       v_id_draw in self.vehicle_tracker.completed_vehicle_ids and \
+                       data_draw.get('status_for_drawing') not in ['exiting', 'timed_out']: # Don't draw if already completed unless it just exited/timedout this frame
+                        continue
 
-                # Draw boxes, trails, markers
-                for v_id_draw, data in ids_processed_this_frame_map.items():
-                    center_pt_draw, box_draw, c_type_draw = data['center'], data['box'], data['type']
-                    current_draw_status = data.get('status', 'detected')
-                    display_status = "detected"; entry_dir_draw = None; t_active_draw = None
 
-                    if v_id_draw in active_vehicle_snapshot:
-                        v_state = active_vehicle_snapshot[v_id_draw]
-                        if v_state.get('status') == 'active':
-                            display_status = 'active'
-                            entry_dir_draw = v_state.get('entry_direction')
-                            t_active_draw = (current_timestamp - v_state['entry_time']).total_seconds() if v_state.get('entry_time') else None
-                    elif current_draw_status == 'exited' or current_draw_status == 'exited_inferred':
-                        display_status = 'exiting'
+                    center_pt_draw, box_draw, type_draw = data_draw['center'], data_draw['box'], data_draw['type']
+                    draw_status = data_draw.get('status_for_drawing', 'detected')
+                    entry_dir_draw = None; time_active_draw = None
 
-                    if current_draw_status != 'timed_out':
-                         visual_overlay.draw_detection_box(output_frame, box_draw, v_id_draw, c_type_draw, status=display_status, entry_dir=entry_dir_draw, time_active=t_active_draw)
+                    # Check active_vehicles for current 'active' state details (entry dir, time active)
+                    active_vehicle_info = self.vehicle_tracker.active_vehicles.get(v_id_draw)
+                    if active_vehicle_info and active_vehicle_info.get('status') == 'active':
+                        draw_status = 'active' # Override if it's truly active
+                        entry_dir_draw = active_vehicle_info.get('entry_direction')
+                        if active_vehicle_info.get('entry_time'):
+                            time_active_draw = (current_timestamp_dt - active_vehicle_info['entry_time']).total_seconds()
+                    
+                    if draw_status != 'timed_out': # Don't draw box for timed out if it wasn't seen this frame
+                         visual_overlay.draw_detection_box(output_frame, box_draw, v_id_draw, type_draw, 
+                                                           status=draw_status, entry_dir=entry_dir_draw, 
+                                                           time_active=time_active_draw)
 
-                    trail = self.vehicle_tracker.get_tracking_trail(v_id_draw)
-                    visual_overlay.draw_tracking_trail(output_frame, trail, v_id_draw)
+                    # Draw trail only for non-completed or just-completed IDs
+                    if v_id_draw not in self.vehicle_tracker.completed_vehicle_ids or \
+                       draw_status in ['exiting', 'timed_out', 'entering']: # Draw trail if it just completed or is new
+                        trail = self.vehicle_tracker.get_tracking_trail(v_id_draw)
+                        visual_overlay.draw_tracking_trail(output_frame, trail, v_id_draw)
 
-                    event_marker = data.get('event')
-                    if event_marker:
-                         visual_overlay.draw_event_marker(output_frame, center_pt_draw, event_marker, v_id_draw[-4:])
-
-                # Draw status overlay
-                output_frame = visual_overlay.add_status_overlay(output_frame, frame_number, current_timestamp, self.vehicle_tracker)
+                    event_marker_draw = data_draw.get('event_marker')
+                    if event_marker_draw:
+                        visual_overlay.draw_event_marker(output_frame, center_pt_draw, event_marker_draw, v_id_draw[-4:])
+                
+                output_frame = visual_overlay.add_status_overlay(output_frame, frame_number, current_timestamp_dt, self.vehicle_tracker)
                 if self.perf: self.perf.end_timer('drawing')
             # --- End Conditional Drawing ---
 
-            # Return logs and the potentially modified (or None) output frame
-            return frame_local_detections, output_frame
+            return frame_local_detections_log, output_frame
             # --- End process_single_frame ---
 
         # --- Main execution for the batch ---
         if self.perf: self.perf.start_timer('detection_processing')
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = {executor.submit(process_single_frame, i): i for i in range(len(results))}
-            for future in concurrent.futures.as_completed(futures):
-                idx = futures[future]
+            # Submit tasks to the executor
+            future_to_idx = {executor.submit(process_single_frame, i): i for i in range(len(results))}
+            
+            for future in concurrent.futures.as_completed(future_to_idx):
+                idx = future_to_idx[future]
                 try:
-                    frame_detections, processed_frame = future.result()
-                    batch_detections_list[idx] = frame_detections
-                    processed_frames_list[idx] = processed_frame # Will be None if visualization disabled
+                    frame_log, processed_frame_viz = future.result()
+                    batch_detections_list[idx] = frame_log
+                    processed_frames_list[idx] = processed_frame_viz
                 except Exception as exc:
-                    print(f'\nError processing frame {frame_numbers[idx]} (batch index {idx}): {exc}')
+                    print(f'\nError processing frame {frame_numbers[idx]} (batch index {idx}) during parallel execution: {exc}')
                     import traceback
                     traceback.print_exc()
-                    # Fallback: Keep frame as None if processing failed
-                    processed_frames_list[idx] = None # Ensure it's None on error
-                    # If visualization was enabled, we might want to write the original resized frame?
-                    # if ENABLE_VISUALIZATION:
-                    #     processed_frames_list[idx] = cv2.resize(frames_batch[idx].copy(), self.frame_shape)
+                    # Ensure lists have placeholders even on error
+                    batch_detections_list[idx] = [] 
+                    processed_frames_list[idx] = None 
+                    if ENABLE_VISUALIZATION: # Attempt to use original frame if drawing fails
+                        try:
+                            processed_frames_list[idx] = cv2.resize(frames_batch[idx][0].copy(), self.frame_shape) if frames_batch[idx][0] is not None else None
+                        except: pass
 
         # Combine logs and frames
-        final_batch_detections = [det for frame_list in batch_detections_list for det in frame_list]
-        # final_processed_frames will be a list of numpy arrays or Nones
-        final_processed_frames = processed_frames_list
+        final_batch_event_logs = [event for frame_events in batch_detections_list for event in frame_events if event]
+        final_processed_frames_for_viz = processed_frames_list # This is already a list of frames or Nones
+
         if self.perf: self.perf.end_timer('detection_processing')
 
-        return final_batch_detections, final_processed_frames
+        return final_batch_event_logs, final_processed_frames_for_viz
     # --- End _process_inference_results ---
 
     # --- Main Processing Function ---
