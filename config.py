@@ -4,8 +4,8 @@ from datetime import datetime
 import torch # Import torch to check GPU capability
 
 PROCESSING_MODE = 'enhanced'
-LINE_MODE = 'hardcoded'
-ENABLE_VISUALIZATION = False
+LINE_MODE = 'interactive'
+ENABLE_VISUALIZATION = True
 
 # --- Input Settings (primarily for hardcoded mode) ---
 INPUT_VIDEO_PATH = "C:/Users/EMAAN/Documents/YOLO/5 minute test - 4 Way Intersection.mp4"
@@ -23,9 +23,9 @@ VIDEO_OUTPUT_DIR = os.path.join(BASE_OUTPUT_DIR, "videos")
 REPORT_OUTPUT_DIR = os.path.join(BASE_OUTPUT_DIR, "reports")
 
 # --- Model Configuration ---
-# MODEL_PATH = r"C:/Users/EMAAN/Documents/YOLO/project/models/weights/SGDMed_SGD_LR0p0100_WD0p00050_Cls1p50_Mix0p15_20250418_112036.pt"
-MODEL_PATH = r"C:/Users/EMAAN/Documents/YOLO/project/models/weights/SGDMed_SGD_LR0p0100_WD0p00050_Cls1p50_Mix0p15_20250418_112036.engine"
-CONF_THRESHOLD = 0.45 # Keep SLIGHTLY LOWER CONF to potentially keep weaker detections
+MODEL_PATH = r"C:/Users/EMAAN/Documents/YOLO/project/models/weights/silent_contract_9082.engine"
+# MODEL_PATH = r"C:/Users/EMAAN/Documents/YOLO/project/models/weights/SGDMed_SGD_LR0p0100_WD0p00050_Cls1p50_Mix0p15_20250418_112036.engine"
+CONF_THRESHOLD = 0.8 # Keep SLIGHTLY LOWER CONF to potentially keep weaker detections
 IOU_THRESHOLD = 0.6   # Keep slightly higher
 MODEL_INPUT_SIZE = 416 # Keep smaller size for performance
 
@@ -59,6 +59,7 @@ else: _default_batch = 32 if PROCESSING_MODE == 'standard' else 128 # Keep large
 OPTIMAL_BATCH_SIZE = _default_batch
 USE_ADVANCED_VIDEO_READER = True 
 PYVIDEOREADER_DECODE_SEGMENT_SIZE = 7500
+FFMPEG_PATH = r'C:\ffmpeg\ffmpeg.exe'
 
 _cpu_count = os.cpu_count(); THREAD_COUNT = min(64, _cpu_count * 2) if _cpu_count else 24
 MIXED_PRECISION = True if PROCESSING_MODE == 'enhanced' and torch.cuda.is_available() else False

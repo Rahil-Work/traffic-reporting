@@ -27,10 +27,13 @@ except Exception as e:
 # --- Gradio Event Handlers ---
 
 # Handle video upload - gets first frame for drawing
-def handle_upload(video_path):
-    debug_print(f"Gradio: Handling video upload: {video_path}")
+def handle_upload(video_file_obj_for_preview): # Renamed to avoid confusion with main processing
+    debug_print(f"Gradio: Handling video upload for preview/drawing: {video_file_obj_for_preview}")
+    video_path_for_preview = None
+    if video_file_obj_for_preview:
+        video_path_for_preview = video_file_obj_for_preview.name # Get path from Gradio file object
     # Processor method should now reset polygon state and prepare frame
-    return processor.process_video_upload_for_gradio(video_path) # Returns initial frame, status
+    return processor.process_video_upload_for_gradio(video_path_for_preview) 
 
 # Set the direction for drawing the *next* polygon
 def handle_set_direction(direction):
@@ -67,26 +70,36 @@ def handle_clear_polygons():
     return frame_with_polys, status
 
 # Process the video (uses finalized polygons)
-def handle_process(video_path, start_date, start_time, primary_direction, progress=gr.Progress(track_tqdm=True)):
-    # This function structure remains the same as before
-    # It calls processor.process_video, which internally uses the finalized polygons
-    # if LINE_MODE is interactive.
-    progress(0, desc="Starting Processing...")
-    debug_print(f"Gradio: Starting video processing for {video_path}")
-    debug_print(f"Gradio: Primary Direction selected: {primary_direction}")
-    if video_path is None:
-        # Return updates for all output components on error
-        return "Please upload a video first.", None, "N/A", "N/A", "N/A", "N/A"
+def handle_process(video_file_obj, start_date, start_time, primary_direction_str, progress=gr.Progress(track_tqdm=True)):
+    progress(0, desc="Initializing...") 
+    debug_print(f"Gradio handle_process: Received video object: {video_file_obj}")
+    debug_print(f"Gradio handle_process: Primary Direction selected: {primary_direction_str}")
+
+    if video_file_obj is None:
+        return "Please upload a video file first.", None, "N/A", "N/A", "N/A", "N/A"
     
-    if not primary_direction:
+    if not primary_direction_str:
          return "Please select a Primary Direction.", None, "N/A", "N/A", "N/A", "N/A"
+
+    # Get the actual filepath from the Gradio File object
+    # Gradio uploads files to a temporary location accessible via .name
+    video_path_from_gradio = video_file_obj.name 
+    debug_print(f"Gradio handle_process: Video path from Gradio object: {video_path_from_gradio}")
+
+    result_message_raw = ""
 
     # Run the processing - processor.process_video uses self.gradio_polygons
     # Add a try-except block here to catch potential errors during processing setup (like zone validation)
     # and report them back to the Gradio UI gracefully.
     try:
-        result_message_raw = processor.process_video(video_path, start_date, start_time, primary_direction=primary_direction.lower())
+        progress(0.05, desc="Starting video processing engine...")
+        result_message_raw = processor.process_video(video_path_from_gradio, start_date, start_time, primary_direction=primary_direction_str.lower())
         debug_print(f"Gradio: Processing finished.")
+    except RuntimeError as rte: 
+         # Catch specific errors VideoProcessor might raise (e.g., for DAV/FFmpeg issues)
+         print(f"Gradio handle_process: RuntimeError during processing: {rte}")
+         progress(0, desc="Error!") 
+         result_message_raw = f"❌ Error: {rte}" 
     except ValueError as ve:
          # Catch specific validation errors (like not enough zones)
          print(f"Gradio: Validation Error during processing setup: {ve}")
@@ -113,15 +126,27 @@ def handle_process(video_path, start_date, start_time, primary_direction, progre
         if match_time: time_seconds = match_time.group(1)
         if match_fps: fps = match_fps.group(1)
         if match_paths: completed_paths = match_paths.group(1)
-        output_log = re.sub(r"--- Summary Stats ---.*", "", result_message_raw, flags=re.DOTALL).strip()
-    elif result_message_raw.startswith("❌ Error:") or result_message_raw.startswith("Error:"):
-         # If process_video returned an error string directly
-         output_log = result_message_raw
-         progress(0, desc="Error!") # Ensure progress shows error if processing failed internally
-    else:
-        # Handle unexpected result format if necessary
-        output_log = "Processing finished, but result format unexpected."
-        progress(1.0, desc="Finished (Unknown State)")
+        # Clean up the log message for display
+        output_log_text = re.sub(r"--- Summary Stats ---.*", "", result_message_raw, flags=re.DOTALL).strip()
+        output_log_text = re.sub(r"STAT_.*", "", output_log_text, flags=re.MULTILINE).strip() # Remove individual STAT lines too
+    elif isinstance(result_message_raw, str) and (result_message_raw.startswith("❌ Error:") or "Error:" in result_message_raw):
+         output_log_text = result_message_raw # Already an error message
+         if progress.total is None or progress.current < progress.total:
+            try:
+                current_progress_val = 0.0 
+                if hasattr(progress, 'value'): current_progress_val = progress.value # Older Gradio
+                elif hasattr(progress, 'index') and hasattr(progress, 'max_index'): # Newer structure
+                     if progress.max_index is not None and progress.max_index > 0 :
+                         current_progress_val = (progress.index or 0) / progress.max_index
+                     elif progress.index is not None : current_progress_val = progress.index # If used as simple counter
+
+                if current_progress_val < 1.0 : # Only update if not already at 100% (e.g. from success path)
+                    progress(0, desc="Error during processing!")
+            except Exception as e_prog:
+                debug_print(f"Gradio: Could not update progress bar on error: {e_prog}")
+    else: # Should not happen if VideoProcessor always returns one of the above formats
+        output_log_text = f"Processing finished, but result format unexpected: {str(result_message_raw)[:300]}"
+        progress(1.0, desc="Finished (Unknown Result State)")
 
 
     # --- Find Output Video ---
@@ -175,7 +200,11 @@ def create_interface():
                 with gr.Row():
                     with gr.Column(scale=1):
                         gr.Markdown("### Upload Video Source")
-                        video_input = gr.Video(label="Video File", height=360)
+                        video_input = gr.File(
+                            label="Video File (.mp4, .avi, .mkv, .mov, .dav etc.)",
+                            file_types=['video', '.dav'], # Suggest accepted types
+                            height = 360
+                        )
                     with gr.Column(scale=1):
                         gr.Markdown("### Set Initial Timestamp")
                         gr.Markdown("Enter the date and time corresponding to the *start* of the video.")
@@ -195,8 +224,8 @@ def create_interface():
                         )
                         gr.Markdown("---") # Separator
                         status_text_draw = gr.Textbox(
-                            label="✏️ Drawing Helper",
-                            value="Upload video first." if LINE_MODE == 'interactive' else "Polygon drawing disabled (hardcoded zones).",
+                            label="✏️ Zone Drawing Helper",
+                            value="Upload video and go to 'Draw Zones' tab.",
                             interactive=False,
                             lines=3, # Keep slightly larger
                             visible=(LINE_MODE == 'interactive')
@@ -233,12 +262,11 @@ def create_interface():
                              label="Click Image to Define Polygon Vertices",
                              type="numpy",
                              interactive=True, # Enable clicks
-                             height=450 # Make drawing area prominent
+                             height=480 # Make drawing area prominent
                          )
 
 
             # --- Tab 3: Process & Results ---
-            # (No structural changes needed in this tab's definition)
             with gr.TabItem("🚀 Process & View Results", id=2):
                 gr.Markdown("### Start Processing")
                 with gr.Row():
@@ -255,10 +283,9 @@ def create_interface():
                 with gr.Group(): # Group log and video output
                     completion_text = gr.Textbox(label="📋 Processing Log", lines=6, interactive=False, show_copy_button=True)
                     gr.Markdown("") # Spacer
-                    video_output = gr.Video(label="🎬 Processed Video", interactive=False)
+                    video_output = gr.Video(label="🎬 Processed Video", interactive=False, height=480)
 
         # --- Event Listeners (Connecting UI to Handlers) ---
-
         # Define outputs commonly updated by drawing actions
         drawing_outputs = []
         if LINE_MODE == 'interactive':
@@ -273,6 +300,13 @@ def create_interface():
         )
 
         if LINE_MODE == 'interactive':
+            video_input.change( # Or .upload if you prefer that trigger
+                fn=handle_upload,
+                inputs=[video_input], # Pass the gr.File object
+                outputs=drawing_outputs, 
+                show_progress="minimal"
+            )
+            
             # Direction Button Actions: Update image display and drawing status text
             north_btn.click(lambda: handle_set_direction("north"), outputs=drawing_outputs, show_progress="minimal")
             south_btn.click(lambda: handle_set_direction("south"), outputs=drawing_outputs, show_progress="minimal")

@@ -15,10 +15,10 @@ import concurrent.futures
 from config import (
     TARGET_FPS, FRAME_WIDTH, FRAME_HEIGHT, OPTIMAL_BATCH_SIZE,
     VIDEO_OUTPUT_DIR, ENABLE_DETAILED_PERFORMANCE_METRICS,
-    MIXED_PRECISION, PARALLEL_STREAMS, DEBUG_MODE, THREAD_COUNT,
+    MIXED_PRECISION, PARALLEL_STREAMS, THREAD_COUNT,
     MEMORY_CLEANUP_INTERVAL, MODEL_PATH, CONF_THRESHOLD, IOU_THRESHOLD,
     LINE_MODE, LINE_POINTS, MODEL_INPUT_SIZE, ENABLE_VISUALIZATION,
-    USE_ADVANCED_VIDEO_READER, PYVIDEOREADER_DECODE_SEGMENT_SIZE
+    USE_ADVANCED_VIDEO_READER, PYVIDEOREADER_DECODE_SEGMENT_SIZE, FFMPEG_PATH
 )
 
 # Modules
@@ -30,6 +30,7 @@ from tracking.zone_tracker import ZoneTracker
 from tracking.cleanup import cleanup_tracking_data
 from visualization import overlay as visual_overlay
 from reporting.excel_report import create_excel_report
+from core.converters import convert_dav_to_mp4_internal
 
 # Conditional imports
 if ENABLE_DETAILED_PERFORMANCE_METRICS:
@@ -457,7 +458,6 @@ class VideoProcessor:
             # Current state of frame_np_content:
             # If source is 'pvr_cuda_segmented':
             #   - It's RGB (is_rgb_input should be True)
-            #   - It's already resized to (target_dim_for_model, target_dim_for_model)
             # If source is 'opencv':
             #   - It's BGR (is_rgb_input should be False)
             #   - It's the original frame size from cap.read()
@@ -482,15 +482,6 @@ class VideoProcessor:
                     img_rgb_model_sized = frame_np_content # Already RGB and correct size
             
             elif source_reader == 'opencv':
-                if is_rgb_input: # Unexpected from OpenCV, but handle
-                    debug_print(f"Preprocess (OpenCV path): Warning! Expected BGR, got RGB? metadata: {metadata}. Assuming it's RGB to be safe for cvtColor.")
-                    # If it was truly RGB, cvtColor to BGR then back to RGB is wasteful but safe.
-                    # Or, assume it's actually BGR and the metadata was wrong.
-                    # For now, let's trust the metadata if it says RGB, and if not, assume BGR.
-                    # This path assumes frame_np_content is BGR as per OpenCV default
-                    pass # It will be handled by cvtColor(COLOR_BGR2RGB) below
-
-                # OpenCV frames are BGR and original size. Resize then convert.
                 resized_bgr = cv2.resize(frame_np_content, 
                                          (target_dim_for_model, target_dim_for_model), 
                                          interpolation=cv2.INTER_LINEAR)
@@ -851,6 +842,31 @@ class VideoProcessor:
         else:
              print("Warning: No Primary Direction provided for RSA report numbering.")
 
+        actual_video_path_to_process = video_path
+        temp_converted_dav_mp4 = None
+
+        if video_path.lower().endswith(".dav"):
+            if not FFMPEG_PATH:
+                error_msg = "ERROR: FFmpeg not found, cannot convert .dav file. Please configure FFMPEG_CUSTOM_PATH in config.py or ensure ffmpeg is in PATH."
+                print(error_msg)
+                raise RuntimeError(error_msg)
+
+            print(f"Input is .dav: {video_path}. Converting and resizing with FFmpeg...")
+            converted_path = convert_dav_to_mp4_internal(video_path)
+            if converted_path and os.path.exists(converted_path):
+                actual_video_path_to_process = converted_path
+                temp_converted_dav_mp4 = converted_path
+                print(f".dav converted to: {actual_video_path_to_process}")
+
+                dav_settle_delay = 0.5 # seconds
+                print(f"Waiting {dav_settle_delay}s for file system to settle after DAV remux...")
+                time.sleep(dav_settle_delay)
+                # --- END DELAY ---
+            else:
+                error_msg = f"Failed to convert .dav file: {video_path}"
+                print(error_msg)
+                raise RuntimeError(error_msg)
+
         try:
             # --- Determine and Validate Zones (Polygon Mode) ---
             self.detection_zones_polygons = None
@@ -947,8 +963,6 @@ class VideoProcessor:
                     frames_batch_with_metadata.append((frame_content, metadata))
                     frame_numbers_batch.append(frame_number)
                     frame_times_batch.append(frame_time_sec)
-
-                    # if hasattr(self.frame_read_queue, 'task_done'): self.frame_read_queue.task_done() # Mark item as processed from queue
 
                     # Process when batch is full
                     if len(frames_batch_with_metadata) >= self.batch_size:
@@ -1144,6 +1158,13 @@ class VideoProcessor:
                 if hasattr(self, 'writer_thread') and self.writer_thread and self.writer_thread.is_alive():
                     self.writer_thread.join(timeout=1)
             except Exception as join_e: print(f"Error joining threads: {join_e}")
+
+            if temp_converted_dav_mp4: # Cleanup converted DAV file
+                try:
+                    debug_print(f"Cleaning up temporary converted DAV file: {temp_converted_dav_mp4}")
+                    os.remove(temp_converted_dav_mp4)
+                except OSError as e_del:
+                    debug_print(f"Error deleting temporary DAV converted file {temp_converted_dav_mp4}: {e_del}")
 
             # Reset components
             self.model=None; self.vehicle_tracker=None; self.zone_tracker=None; self.perf=None; self.detection_zones_polygons=None
